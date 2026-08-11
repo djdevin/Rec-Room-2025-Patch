@@ -7,5 +7,6 @@ Honestly this was a just a fun little project to share to everyone and (hopefull
 - Better Dump
 
 This is compatiable with the build 19/07/25 (19th July 2025)
+which is also vanadium's exact build ^^
 
 so uhhh yeah have fun with it ig.
