@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstdint>
 #include <tlhelp32.h>
+#include <vector>
 
 
 #include "../deps/minhook/include/MinHook.h"
