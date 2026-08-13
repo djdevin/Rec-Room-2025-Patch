@@ -18,23 +18,27 @@ void set(void* obj, std::ptrdiff_t offset, T val) {
 	*(T*)((std::uint8_t*)obj + offset) = val;
 }
 
-char* ReadIl2CppString(Il2cppString* il2cppString) {
+std::string ReadIl2CppString(Il2cppString* il2cppString) {
+	if (il2cppString == nullptr)
+		return {};
 
-    if (il2cppString == nullptr) {
-        return nullptr;
-    }
+	int32_t length = *reinterpret_cast<int32_t*>(reinterpret_cast<char*>(il2cppString) + 0x10);
 
-    size_t length = static_cast<size_t>(il2cppString->Length);
-    const size_t bufferSize = (length + 1) * sizeof(wchar_t);
-    char* internalString = new char[bufferSize];
-    size_t convertedChars = 0;
+	if (length < 0 || length > 8192) {
+		return {};
+	}
 
-    errno_t result = wcstombs_s(&convertedChars, internalString, bufferSize, reinterpret_cast<wchar_t*>(il2cppString) + 0xA, length);
+	std::wstring wide(reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(il2cppString) + 0x14),
+		static_cast<size_t>(length));
 
-    if (result != 0) {
-        delete[] internalString;
-        return nullptr;
-    }
+	size_t bufferSize = (length + 1) * sizeof(wchar_t);
+	std::vector<char> buf(bufferSize);
+	size_t convertedChars = 0;
+	errno_t result = wcstombs_s(&convertedChars, buf.data(), bufferSize, wide.c_str(), length);
 
-    return internalString;
+	if (result != 0) {
+		return {};
+	}
+
+	return std::string(buf.data());
 }
