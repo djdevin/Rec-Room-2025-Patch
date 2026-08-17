@@ -16,6 +16,9 @@
 
 static const wchar_t* kProcessName = L"Recroom_Release.exe";
 static const wchar_t* kDefaultDll  = L"2025Patch.dll";
+// How long the window lingers after a successful run, just long enough to read
+// the last line. Failures still wait on Enter instead.
+static const std::chrono::milliseconds kExitDelay{1500};
 
 // Modules the patch needs present before it can hook anything.
 static const wchar_t* kRequiredModules[] = { L"GameAssembly.dll", L"Referee.dll" };
@@ -177,8 +180,7 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring dllName = dllPath.substr(dllPath.find_last_of(L"\\/") + 1);
     if (ProcessHasModule(pid, dllName.c_str())) {
         std::wcout << L"[=] " << dllName << L" is already loaded. Nothing to do.\n";
-        std::wcout << L"\nPress Enter to exit...";
-        std::wcin.get();
+        std::this_thread::sleep_for(kExitDelay);
         return 0;
     }
 
@@ -196,13 +198,15 @@ int wmain(int argc, wchar_t** argv) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
     std::wcout << L"[*] Injecting...\n";
-    if (Inject(pid, dllPath)) {
-        std::wcout << L"[+] Done. The patch is loaded.\n";
-    } else {
+    if (!Inject(pid, dllPath)) {
+        // Only stall on failure, so the reason stays on screen.
         std::wcout << L"[!] Injection failed. See messages above.\n";
+        std::wcout << L"\nPress Enter to exit...";
+        std::wcin.get();
+        return 1;
     }
 
-    std::wcout << L"\nPress Enter to exit...";
-    std::wcin.get();
+    std::wcout << L"[+] Done. The patch is loaded.\n";
+    std::this_thread::sleep_for(kExitDelay);
     return 0;
 }
