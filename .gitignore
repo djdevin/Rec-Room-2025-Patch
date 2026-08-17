@@ -1,0 +1,49 @@
+# Visual Studio build output
+[Xx]64/
+[Xx]86/
+[Ww]in32/
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+[Dd]ebug[Pp]ublic/
+[Rr]eleases/
+*.tlog/
+
+# Build artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.iobj
+*.ipdb
+*.res
+*.pch
+*.ipch
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
+*.unsuccessfulbuild
+
+# Visual Studio / IDE
+.vs/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.idea/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
