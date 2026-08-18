@@ -1,9 +1,16 @@
 #pragma once
 #include "../Methods.h"
+#include "../Config.h"
 #include "../../Utils/scan.h"
 #include "../../Utils/deps/spoofcall/RetSpoof.hpp"
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+
+// Routine per-request chatter goes through TraceLog, anomalies keep using PatchLog. SendRequest_H is
+// load-bearing (it performs the host rewrite) but logged 4 lines for EVERY request, which buried the
+// interesting lines in a normal session. Gating only the routine ones keeps the log readable without
+// touching behaviour.
+#define TraceLog(...) do { if (RR::Config::EnableTracing) PatchLog(__VA_ARGS__); } while (0)
 
 void (*nop_O)();
 void nop_H() {
@@ -14,7 +21,7 @@ void (*SendRequest_O)(void*);
 void SendRequest_H(void* request) {
 	static long s_n = 0;
 	long n = ++s_n;
-	PatchLog("[SendRequest] #%ld enter request=%p", n, request);
+	TraceLog("[SendRequest] #%ld enter request=%p", n, request);
 
 	// Everything the hook does before forwarding is best-effort: it must NEVER take down the game.
 	// An uncaught C++ exception here (bad_alloc, or std::string from a null pointer during the
@@ -31,7 +38,9 @@ void SendRequest_H(void* request) {
 		Il2cppString* Uri = spoof_call(RetAddr, fn, uri);
 
 		std::string find = "ns.rec.net";
-		std::string replace = "ns.recflare.net"; // recflare nameserver (serves the *.recflare.net service map)
+		// The mirror's nameserver (serves the service map). From 2025patch.ini; defaults to
+		// ns.recflare.net. The host being replaced is the dead official one, so it stays fixed.
+		std::string replace = RR::Config::ApiHost;
 
 		// ReadIl2CppString returns a new[]-allocated buffer or nullptr. `std::string s = nullptr` is
 		// undefined behavior (this was the intermittent crash) -- guard it, and free the buffer (the
@@ -40,16 +49,16 @@ void SendRequest_H(void* request) {
 		if (!raw) {
 			PatchLog("[SendRequest] #%ld uri unreadable, passing through", n);
 			SendRequest_O(request);
-			PatchLog("[SendRequest] #%ld returned", n);
+			TraceLog("[SendRequest] #%ld returned", n);
 			return;
 		}
 		std::string url(raw);
 		delete[] raw;
 
-		PatchLog("[SendRequest] #%ld url=%s", n, url.c_str());
+		TraceLog("[SendRequest] #%ld url=%s", n, url.c_str());
 		if (url.find(find) != std::string::npos) {
 			url.replace(url.find(find), find.length(), replace);
-			PatchLog("[SendRequest] #%ld REWRITE -> %s", n, url.c_str());
+			TraceLog("[SendRequest] #%ld REWRITE -> %s", n, url.c_str());
 
 			using Il2cppStringNewFn = Il2cppString * (*)(const char*);
 			auto fn2 = reinterpret_cast<Il2cppStringNewFn>(GA + RR::Methods::Il2cpp::il2cpp_string_new);
@@ -91,9 +100,9 @@ void SendRequest_H(void* request) {
 		PatchLog("[SendRequest] #%ld exception in hook, passing through unchanged", n);
 	}
 
-	PatchLog("[SendRequest] #%ld -> original", n);
+	TraceLog("[SendRequest] #%ld -> original", n);
 	SendRequest_O(request);
-	PatchLog("[SendRequest] #%ld returned", n);
+	TraceLog("[SendRequest] #%ld returned", n);
 	return;
 }
 
@@ -187,6 +196,40 @@ void* Req10_H(void* m, uint64_t svc, Il2cppString* path, void* a4, void* a5, uin
 }
 
 // ---------------------------------------------------------------------------------------------
+// Request-pump probes -- locate exactly where the room-save blob dies.
+//
+// See RR::Methods::HttpClient in Methods.h. The blob is logged by Req9/Req10 (it IS enqueued) and
+// then never reaches SendRequest, and it is not escaping via another transport: all 177 [HTTP<-]
+// responses in the 2026-08-17 run matched a SendRequest, zero unmatched. These two hooks split the
+// remaining gap in half.
+//
+// Both targets are async, so they return a Task immediately and these hooks only observe ENTRY --
+// enough to answer "did this request get that far", which is the whole question. Pass every argument
+// through untouched; the stack slots are modelled as uint64_t because each occupies one full slot
+// regardless of declared width (bool, Nullable<int> and CancellationToken are all <=8 bytes).
+// ---------------------------------------------------------------------------------------------
+void* (*Pump_O)(void*, uint64_t, void*);
+void* Pump_H(void* queue, uint64_t ct, void* mi) {
+	// The pump ticking at all is the signal; log the queue identity so a stalled queue is visible as
+	// "enqueued to X, but X never pumped again".
+	PatchLog("[Pump] KOMEOKGFOBP queue=%p", queue);
+	return Pump_O(queue, ct, mi);
+}
+
+void* (*Send_O)(uint32_t, void*, uint64_t, Il2cppString*, void*, uint64_t, uint64_t, void*, void*, uint64_t, void*);
+void* Send_H(uint32_t attempt, void* method, uint64_t svc, Il2cppString* path, void* a5, uint64_t a6,
+             uint64_t a7, void* a8, void* a9, uint64_t a10, void* mi) {
+	__try {
+		if (path) {
+			char* p = ReadIl2CppString(path);
+			if (p) { PatchLog("[Send] attempt=%u svc=%llu path=%s", attempt, svc, p); delete[] p; }
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return Send_O(attempt, method, svc, path, a5, a6, a7, a8, a9, a10, mi);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Force Photon PAYLOAD encryption (disable datagram encryption).
 //
 // See RR::Methods::Photon in Methods.h for the reasoning. Short version: Luxon only implements
@@ -208,6 +251,153 @@ bool IsTransportEncrypted_H(void* self, void* mi) {
 		PatchLog("[Crypto] EnetPeer.IsTransportEncrypted original=%d -> forcing FALSE (payload encryption)", orig ? 1 : 0);
 	}
 	return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Quit tracer -- names whoever asks the client to exit.
+//
+// See RR::Methods::AppLifecycle. The exit is orderly, not a crash, so there IS a caller; we log a
+// native stack walk at the Running => PreparingToExit transition and convert each frame to a
+// GameAssembly RVA, which can be looked up in the Cpp2IL dump to name the method. Frames outside
+// GameAssembly are printed absolute so Unity/system callers stay distinguishable.
+// ---------------------------------------------------------------------------------------------
+// Resolve every frame to module+offset, not just GameAssembly. The GameAssembly-only version left
+// the interesting half of the exit stack as bare addresses; naming the module is what shows the quit
+// arriving from UnityPlayer rather than from game code. GameAssembly offsets are RVAs -- feed them to
+//   py whatis2025.py --dump C:\Games\RecRoom_Info\Code\2025-07-19_02-45-25 <rva>
+// or, for better coverage (346k methods vs the dump's 241k), look them up in il2cpp-2025/methods.pkl.
+static void LogStack(const char* tag) {
+	void* frames[24] = {};
+	USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+	PatchLog("[%s] stack, %u frames", tag, n);
+	for (USHORT i = 0; i < n; ++i) {
+		uintptr_t a = (uintptr_t)frames[i];
+		HMODULE m = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       (LPCSTR)a, &m) && m) {
+			char path[MAX_PATH] = {};
+			GetModuleFileNameA(m, path, MAX_PATH);
+			const char* base = strrchr(path, '\\');
+			base = base ? base + 1 : path;
+			PatchLog("[%s]   #%u %s+0x%llX", tag, i, base, (unsigned long long)(a - (uintptr_t)m));
+		} else {
+			PatchLog("[%s]   #%u %p", tag, i, frames[i]);
+		}
+	}
+}
+
+void (*SetExitState_O)(int32_t, void*);
+void SetExitState_H(int32_t state, void* mi) {
+	__try {
+		PatchLog("[Exit] AppExitState := %d (0=Running 1=PreparingToExit 2=ReadyForExit)", state);
+		LogStack("Exit");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	SetExitState_O(state, mi);
+}
+
+// UnityEngine.Application.Quit() / Quit(int).
+//
+// The exit stack proved the request enters managed code at Application.Internal_ApplicationWantsToQuit
+// -- i.e. Unity's native layer already decided to quit before any Rec Room code ran. Two things reach
+// that point: a managed Application.Quit() call, or a platform close request (WM_CLOSE / Alt+F4 /
+// task kill). These hooks tell them apart: if [Quit] never fires yet the app still exits, nothing in
+// managed code asked for it and the close came from the OS.
+//
+// One uniform 2-arg signature covers both overloads. In the x64 ABI a callee simply ignores register
+// arguments it does not declare, so forwarding (a1, a2) is safe whether the real shape is
+// (MethodInfo*) or (int exitCode, MethodInfo*).
+void (*AppQuit_O)(uintptr_t, uintptr_t);
+void AppQuit_H(uintptr_t a1, uintptr_t a2) {
+	__try {
+		PatchLog("[Quit] UnityEngine.Application.Quit called (a1=0x%llX)", (unsigned long long)a1);
+		LogStack("Quit");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	AppQuit_O(a1, a2);
+}
+void (*AppQuit2_O)(uintptr_t, uintptr_t);
+void AppQuit2_H(uintptr_t a1, uintptr_t a2) {
+	__try {
+		PatchLog("[Quit] UnityEngine.Application.Quit (overload 2) called (a1=0x%llX)", (unsigned long long)a1);
+		LogStack("Quit");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	AppQuit2_O(a1, a2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Anti-cheat module-scan suppressor -- see RR::Methods::AntiCheat for how this was found.
+//
+// CheatManager's scan spots our injected 2025Patch.dll among the loaded modules and calls this
+// closure, whose ENTIRE body is SessionManager.FatalApplicationQuit(533223478, filenames). So this
+// is a REPLACE-ONLY hook: we must never call the original, or the client quits anyway.
+//
+// We still log what it found, both to confirm the suppression works and because the filenames string
+// is the only place the client tells us what it objects to -- if it ever lists something other than
+// our DLL, that is worth seeing rather than silently swallowing.
+//
+// Note this suppresses the REACTION, not the detection: the scan still runs and still finds us.
+// Hiding the module from the PEB loader list would defeat it at the source (recnet-patcher has a
+// module_hide.c doing exactly that) and is the better fix if the scan ever grows a second consumer.
+// ---------------------------------------------------------------------------------------------
+void CheatQuit_H(void* self, void* mi) {
+	__try {
+		Il2cppString* fn = self ? *(Il2cppString**)((uint8_t*)self + 0x10) : nullptr;  // .filenames
+		char* s = fn ? ReadIl2CppString(fn) : nullptr;
+		PatchLog("[CheatMgr] module scan flagged \"%s\" -> FatalApplicationQuit SUPPRESSED",
+			s ? s : "<null>");
+		if (s) delete[] s;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	// Deliberately NOT calling the original.
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rec Room shutdown API tracers. See RR::Methods::AppLifecycle.
+//
+// FatalApplicationQuit(int, string) is the prize: it is handed the reason as a plain string, so this
+// turns "why did it quit" into a single log line instead of another stack walk. All static il2cpp
+// methods, so MethodInfo* is the LAST argument.
+// ---------------------------------------------------------------------------------------------
+void (*TryQuit0_O)(void*);
+void TryQuit0_H(void* mi) {
+	__try { PatchLog("[Shutdown] TryApplicationQuit()"); LogStack("Shutdown"); }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	TryQuit0_O(mi);
+}
+
+void (*TryQuit1_O)(int32_t, void*);
+void TryQuit1_H(int32_t code, void* mi) {
+	__try { PatchLog("[Shutdown] TryApplicationQuit(code=%d)", code); LogStack("Shutdown"); }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	TryQuit1_O(code, mi);
+}
+
+void (*FatalQuit_O)(int32_t, Il2cppString*, void*);
+void FatalQuit_H(int32_t code, Il2cppString* msg, void* mi) {
+	__try {
+		char* m = msg ? ReadIl2CppString(msg) : nullptr;
+		PatchLog("[Shutdown] FatalApplicationQuit(code=%d, msg=\"%s\")", code, m ? m : "<null>");
+		if (m) delete[] m;
+		LogStack("Shutdown");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	FatalQuit_O(code, msg, mi);
+}
+
+void* (*Logout_O)(void*);
+void* Logout_H(void* mi) {
+	__try { PatchLog("[Shutdown] LogoutToBootScene()"); LogStack("Shutdown"); }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return Logout_O(mi);
+}
+
+void* (*LogoutAsync_O)(void*);
+void* LogoutAsync_H(void* mi) {
+	__try { PatchLog("[Shutdown] LogoutToBootSceneAsync()"); LogStack("Shutdown"); }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return LogoutAsync_O(mi);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -241,32 +431,26 @@ bool VerifyImageSig_H(void* data, void* sig, void* mi) {
 // =============================================================================================
 // PHOTON BACKEND SELECTION
 //
-// UsePhotonCloud = false -> self-hosted Photon server (Luxon). DNS for the Photon name server is
-//                           redirected to PhotonHost below.
+// All of these live in 2025patch.ini now (RR::Config, see Config.h) -- defaults in parentheses.
+//
+// UsePhotonCloud = false (default) -> self-hosted Photon server (Luxon). DNS for the Photon name
+//                           server is redirected to PhotonHost (photon.recflare.net), and
+//                           PhotonPort, if non-zero, overrides the connect port.
 // UsePhotonCloud = true  -> real Photon Cloud. The DNS redirect is skipped so ns.exitgames.com
-//                           resolves normally, and the app ids below are injected into AppSettings
-//                           just before connect (the server-supplied ids belong to the self-hosted
-//                           deployment and are not valid on Cloud).
+//                           resolves normally, and CloudAppIdRealtime/Voice/Chat + CloudFixedRegion
+//                           are injected into AppSettings just before connect (the server-supplied
+//                           ids belong to the self-hosted deployment and are not valid on Cloud).
 //
 // This exists to isolate a failure: against Luxon the client joins, gets ~4 SetProperties answered,
 // then receives NO responses for ~50s and dies with "Unable to send message!". Running the same
 // client against Photon Cloud says whether that is a Luxon bug or a client/patch bug -- worth
 // knowing before changing the server.
 //
-// Paste the three GUIDs from the Photon dashboard. Leave a value empty to keep whatever the server
-// supplied for that one.
+// Set UsePhotonCloud=true ONLY to A/B against real Photon Cloud, pasting the three GUIDs from the
+// Photon dashboard (leave one empty to keep whatever the server supplied for it). That test has
+// been run: Cloud reproduced the failure identically, proving Photon/Luxon are NOT the cause -- the
+// blocker is the room's missing save data. The default stays false, i.e. the self-hosted server.
 // =============================================================================================
-// Set true ONLY to A/B against real Photon Cloud. That test has been run: Cloud reproduced the
-// failure identically, proving Photon/Luxon are NOT the cause -- the blocker is the room's missing
-// save data. Left false so the client targets the self-hosted server.
-constexpr bool UsePhotonCloud = false;
-
-const char* CloudAppIdRealtime = "8f322bdb-2b1f-4c27-a232-01436f43d14e";  // Photon Realtime / PUN app id
-const char* CloudAppIdVoice    = "6b4682e1-a1a9-4e04-b44a-6db0049a4df3";  // Photon Voice app id
-const char* CloudAppIdChat     = "55fae86e-0459-4f97-bf6c-39c9341da6ef";  // Photon Chat app id
-const char* CloudFixedRegion   = "";  // e.g. "us"; empty = let the client pick via name server
-
-const char* PhotonHost = "photon.recflare.net"; // recflare self-hosted Photon server
 
 // ---------------------------------------------------------------------------------------------
 // Inject Photon Cloud app ids into AppSettings just before the client connects.
@@ -290,11 +474,11 @@ static void SetAppSettingsString(void* settings, int offset, const char* value, 
 
 bool ConnectUsingSettings_H(void* self, void* settings, void* mi) {
 	__try {
-		if (settings && UsePhotonCloud) {
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdRealtime, CloudAppIdRealtime, "AppIdRealtime");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdVoice,    CloudAppIdVoice,    "AppIdVoice");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdChat,     CloudAppIdChat,     "AppIdChat");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::FixedRegion,   CloudFixedRegion,   "FixedRegion");
+		if (settings && RR::Config::UsePhotonCloud) {
+			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdRealtime, RR::Config::CloudAppIdRealtime, "AppIdRealtime");
+			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdVoice,    RR::Config::CloudAppIdVoice,    "AppIdVoice");
+			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdChat,     RR::Config::CloudAppIdChat,     "AppIdChat");
+			SetAppSettingsString(settings, RR::Offsets::AppSettings::FixedRegion,   RR::Config::CloudFixedRegion,   "FixedRegion");
 
 			// Cloud requires the name server (it is how a region is resolved), and any Server/Port
 			// override left over from the self-hosted path would send us straight back to Luxon.
@@ -302,6 +486,15 @@ bool ConnectUsingSettings_H(void* self, void* settings, void* mi) {
 			set<void*>(settings, RR::Offsets::AppSettings::Server, nullptr);
 			set<int32_t>(settings, RR::Offsets::AppSettings::Port, 0);
 			PatchLog("[PhotonCloud] UseNameServer=true, Server cleared -> connecting to Photon Cloud");
+		}
+		// Self-hosted with a non-default port: the host itself is redirected at the DNS layer, but the
+		// port never passes through getaddrinfo, so it has to be set on AppSettings here. 0 (the
+		// default) leaves whatever the client/server negotiated, which is the previous behaviour.
+		else if (settings && RR::Config::PhotonPort != 0) {
+			int32_t was = read<int32_t>(settings, RR::Offsets::AppSettings::Port);
+			set<int32_t>(settings, RR::Offsets::AppSettings::Port, (int32_t)RR::Config::PhotonPort);
+			PatchLog("[Photon] Port %d -> %d (PhotonPort, host %s via DNS redirect)",
+				(int)was, RR::Config::PhotonPort, RR::Config::PhotonHost);
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -314,12 +507,57 @@ bool IsPhotonHost(const std::string& node) {
 		|| node.find("photonindustries") != std::string::npos;
 }
 
+// Telemetry/analytics/crash/feature-flag hosts that do not exist on the archival backend. They never
+// resolve, but every attempt still goes to the OS resolver and the client retries on a timer, and the
+// System.Net.Http ones (RudderStack/Statsig/Unity) tie up connection-pool slots the room-load path
+// then waits behind -- Player.log fills with "Curl error 6: Could not resolve host" and a storm of
+// ServicePointScheduler.WaitAsync stalls. Failing the lookup ourselves (WSAHOST_NOT_FOUND) returns the
+// SAME "not found" the resolver eventually would, just instantly, so the client's existing
+// handle-the-failure path runs without the wait. Substring match -- these cover every subdomain seen
+// (recroom-dataplane.rudderstack.com, submit.backtrace.io, cdp/perf-events/config.uca.cloud.unity3d.com).
+// Gated by RR::Config::BlockDeadHosts (default true). NOTE: the list DOES include some *.recflare.net
+// subdomains -- see the warning inside about why blocking those is a trade-off, not a free win.
+bool IsDeadHost(const std::string& node) {
+	static const char* kDeadHosts[] = {
+		"rudderstack.com",    // RecNet analytics data plane
+		"statsigapi.net",     // Statsig feature flags
+		"backtrace.io",       // Backtrace crash upload
+		"cloud.unity3d.com",  // Unity analytics / perf-events / remote config (uca)
+
+		// ⚠️ THIRD-PARTY HOSTS ONLY. Never add a *.recflare.net host here.
+		//
+		// These sit on CBACIMLIBPF's SINGLE SERIAL request queue -- the same one the room-save blob
+		// (cdn.recflare.net/room/...) waits in, at roughly position 100. Blocking a host on that queue
+		// is NOT free: the intuition "NXDOMAIN fails in milliseconds, so blocking costs nothing" is
+		// wrong, because the cost is the client's RETRY BACKOFF, not the lookup. Measured 2026-08-17 --
+		// one blocked `data/event` POST retried at ~5.5s and ~13.7s and held the queue for 24.68s, so
+		// the blob was sent at 36.6s against a 30s room-load timeout and missed by ~6s. Blocked and
+		// NXDOMAIN are equally bad; only an INSTANT response stops the backoff.
+		//
+		// All four recflare subdomains that used to be listed here were retired on 2026-08-17 once the
+		// mirror implemented them (datacollection -> 200; cards / moderation / platformnotifications ->
+		// fast 404, which is fine -- a definitive HTTP response does not trigger the transport-failure
+		// backoff. config.recflare.net is still NXDOMAIN but unused, and blocking it changed nothing).
+		// To retire any future entry the order matters: stub it server-side FIRST, then remove it here.
+	};
+	for (const char* h : kDeadHosts) {
+		if (node.find(h) != std::string::npos) return true;
+	}
+	return false;
+}
+
 int (WSAAPI* getaddrinfo_O)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
 int WSAAPI getaddrinfo_H(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA* pHints, PADDRINFOA* ppResult) {
-	if (!UsePhotonCloud && pNodeName && IsPhotonHost(pNodeName)) {
-		std::cout << "Photon: " << pNodeName << " -> " << PhotonHost << std::endl;
-		PatchLog("[Photon] getaddrinfo %s -> %s", pNodeName, PhotonHost);
-		return getaddrinfo_O(PhotonHost, pServiceName, pHints, ppResult);
+	if (RR::Config::BlockDeadHosts && pNodeName && IsDeadHost(pNodeName)) {
+		PatchLog("[DNS] %s -> BLOCKED (dead telemetry host)", pNodeName);
+		if (ppResult) *ppResult = nullptr;
+		WSASetLastError(WSAHOST_NOT_FOUND);
+		return WSAHOST_NOT_FOUND;
+	}
+	if (!RR::Config::UsePhotonCloud && pNodeName && IsPhotonHost(pNodeName)) {
+		std::cout << "Photon: " << pNodeName << " -> " << RR::Config::PhotonHost << std::endl;
+		PatchLog("[Photon] getaddrinfo %s -> %s", pNodeName, RR::Config::PhotonHost);
+		return getaddrinfo_O(RR::Config::PhotonHost, pServiceName, pHints, ppResult);
 	}
 	// Log every other lookup too. The room-save download does NOT go through BestHTTP (it uses the
 	// System.Net.Http client, CBACIMLIBPF), so our SendRequest hook is blind to it -- but its DNS
@@ -335,12 +573,18 @@ int WSAAPI GetAddrInfoW_H(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW
 		size_t converted = 0;
 		wcstombs_s(&converted, node, pNodeName, _TRUNCATE);
 
-		if (!UsePhotonCloud && IsPhotonHost(node)) {
-			std::cout << "Photon: " << node << " -> " << PhotonHost << std::endl;
+		if (RR::Config::BlockDeadHosts && IsDeadHost(node)) {
+			PatchLog("[DNS] %s (W) -> BLOCKED (dead telemetry host)", node);
+			if (ppResult) *ppResult = nullptr;
+			WSASetLastError(WSAHOST_NOT_FOUND);
+			return WSAHOST_NOT_FOUND;
+		}
+		if (!RR::Config::UsePhotonCloud && IsPhotonHost(node)) {
+			std::cout << "Photon: " << node << " -> " << RR::Config::PhotonHost << std::endl;
 
-			PatchLog("[Photon] GetAddrInfoW %s -> %s", node, PhotonHost);
+			PatchLog("[Photon] GetAddrInfoW %s -> %s", node, RR::Config::PhotonHost);
 			wchar_t wideHost[NI_MAXHOST] = {};
-			mbstowcs_s(&converted, wideHost, PhotonHost, _TRUNCATE);
+			mbstowcs_s(&converted, wideHost, RR::Config::PhotonHost, _TRUNCATE);
 			return GetAddrInfoW_O(wideHost, pServiceName, pHints, ppResult);
 		}
 		PatchLog("[DNS] %s (W)", node);
@@ -446,6 +690,41 @@ static void LogOpResponse(const char* proto, void* resp) {
 	if (msg) delete[] msg;
 }
 
+// Incoming EVENTS -- a separate path from operation responses, and previously a blind spot: the
+// tracer logged outgoing ops, status callbacks and op responses, so a server-pushed event was
+// invisible. Photon reserves code 251 = ErrorInfo, which is exactly how a server tells a client
+// something is wrong, so "did Photon ask us to quit?" was unanswerable without this.
+//
+// EventData layout (ExitGames.Client.Photon.EventData): Code uint8_t @16.
+static const char* PhotonEventName(unsigned code) {
+	switch (code) {
+		case 251: return "ErrorInfo";
+		case 252: return "AzureNodeInfo";
+		case 253: return "PropertiesChanged";
+		case 254: return "Leave";
+		case 255: return "Join";
+		default:  return "game-event";
+	}
+}
+static void LogEventData(const char* proto, void* ev) {
+	if (!ev) return;
+	unsigned code = *(uint8_t*)((uint8_t*)ev + 16);
+	PatchLog("[Photon] <<= Event[%s] code=%u (%s)", proto, code, PhotonEventName(code));
+}
+
+typedef void* (*DeserEvent_t)(void* self, void* stream, int flags, void* mi);
+DeserEvent_t Ev16_O = nullptr, Ev18_O = nullptr;
+void* Ev16_H(void* self, void* stream, int flags, void* mi) {
+	void* r = Ev16_O(self, stream, flags, mi);
+	__try { LogEventData("P16", r); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+	return r;
+}
+void* Ev18_H(void* self, void* stream, int flags, void* mi) {
+	void* r = Ev18_O(self, stream, flags, mi);
+	__try { LogEventData("P18", r); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+	return r;
+}
+
 typedef void* (*DeserResp_t)(void* self, void* stream, int flags, void* mi);
 DeserResp_t Deser16_O = nullptr, Deser18_O = nullptr;
 void* Deser16_H(void* self, void* stream, int flags, void* mi) {
@@ -464,6 +743,9 @@ namespace RR::Methods::Photon {
 	uintptr_t EnqueueStatusCallback = 0x752C540;
 	uintptr_t Protocol16_DeserializeOperationResponse = 0x75388D0;
 	uintptr_t Protocol18_DeserializeOperationResponse = 0x753E610;
+	// Server-pushed events (RVAs from il2cpp-2025/methods.pkl).
+	uintptr_t Protocol16_DeserializeEventData = 0x7537E30;
+	uintptr_t Protocol18_DeserializeEventData = 0x753E2F0;
 }
 
 namespace RR::Patches {
@@ -506,16 +788,10 @@ namespace RR::Patches {
 		MH_CreateHook((void*)(GA + RR::Methods::HTTPRequest::SendRequest), &SendRequest_H, (LPVOID*)&SendRequest_O);
 		MH_EnableHook((void*)(GA + RR::Methods::HTTPRequest::SendRequest));
 
-		// Response logger -- joins to the SendRequest line by request pointer.
-		MH_CreateHook((void*)(GA + RR::Methods::HTTPRequest::CallCallback), &CallCallback_H, (LPVOID*)&CallCallback_O);
-		MH_EnableHook((void*)(GA + RR::Methods::HTTPRequest::CallCallback));
-
-		// HttpClient path logger -- this is where the room save/asset downloads actually go.
-		MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Request9), &Req9_H, (LPVOID*)&Req9_O);
-		MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Request9));
-
-		MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Request10), &Req10_H, (LPVOID*)&Req10_O);
-		MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Request10));
+		// Anti-cheat module-scan suppressor. THIS is the fix for the idle "auto logout + quit";
+		// replace-only, since the original does nothing but fatally quit.
+		MH_CreateHook((void*)(GA + RR::Methods::AntiCheat::ModuleScanDetected), &CheatQuit_H, (LPVOID*)&nop_O);
+		MH_EnableHook((void*)(GA + RR::Methods::AntiCheat::ModuleScanDetected));
 
 		// Image content-signature bypass -- mirrored assets can never satisfy rec.net's RSA signature,
 		// and the resulting throw stalls the shared request pump that the room save-data blob is
@@ -535,21 +811,9 @@ namespace RR::Patches {
 		MH_CreateHookApiEx(L"ws2_32", "GetAddrInfoW", &GetAddrInfoW_H, (LPVOID*)&GetAddrInfoW_O, &GetAddrInfoWTarget);
 		MH_EnableHook(GetAddrInfoWTarget);
 
-		// Photon protocol tracer -- logs every operation sent + every connection status, to diagnose
-		// the game-session join hang against Luxon.
-		MH_CreateHook((void*)(GA + RR::Methods::Photon::SendOperation), &SendOp_H, (LPVOID*)&SendOp_O);
-		MH_EnableHook((void*)(GA + RR::Methods::Photon::SendOperation));
-
-		MH_CreateHook((void*)(GA + RR::Methods::Photon::EnqueueStatusCallback), &EnqStatus_H, (LPVOID*)&EnqStatus_O);
-		MH_EnableHook((void*)(GA + RR::Methods::Photon::EnqueueStatusCallback));
-
-		// Incoming operation-response tracer (both protocol impls; whichever fires reveals the active
-		// serialization AND the server's return codes).
-		MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeOperationResponse), &Deser16_H, (LPVOID*)&Deser16_O);
-		MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeOperationResponse));
-
-		// Photon backend selection: inject Cloud app ids just before connect (no-op when
-		// UsePhotonCloud is false, but the hook is cheap and keeps one code path).
+		// Photon backend selection: inject Cloud app ids just before connect, or apply PhotonPort on
+		// the self-hosted path (no-op with the defaults, but the hook is cheap and keeps one code
+		// path -- both are config-driven now, so it must be installed either way).
 		MH_CreateHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings), &ConnectUsingSettings_H, (LPVOID*)&ConnectUsingSettings_O);
 		MH_EnableHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings));
 
@@ -557,10 +821,83 @@ namespace RR::Patches {
 		// using payload encryption, so datagram encryption was never the cause of Luxon's silence.
 		// Kept only as a recorded dead end so it is not re-tried.
 
-		MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeOperationResponse), &Deser18_H, (LPVOID*)&Deser18_O);
-		MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeOperationResponse));
+		// ---- Diagnostic tracing (EnableTracing in 2025patch.ini, default false) --------------
+		// None of these change behaviour; they only log. Kept rather than deleted because they
+		// are the only way to see inside the serial request queue or catch a server-pushed
+		// Photon event -- see the comment blocks beside each hook for what each one answered.
+		if (RR::Config::EnableTracing) {
+			// Response logger -- joins to the SendRequest line by request pointer.
+			MH_CreateHook((void*)(GA + RR::Methods::HTTPRequest::CallCallback), &CallCallback_H, (LPVOID*)&CallCallback_O);
+			MH_EnableHook((void*)(GA + RR::Methods::HTTPRequest::CallCallback));
 
-		PatchLog("[Patch] all hooks installed (Referee x4, TLS, SendRequest, ImgSig, getaddrinfo, GetAddrInfoW, Photon-trace)");
-		PatchLog("[Patch] API host=ns.recflare.net  Photon host=%s", PhotonHost);
+			// HttpClient path logger -- this is where the room save/asset downloads actually go.
+			MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Request9), &Req9_H, (LPVOID*)&Req9_O);
+			MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Request9));
+
+			MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Request10), &Req10_H, (LPVOID*)&Req10_O);
+			MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Request10));
+
+			// Quit tracer -- diagnostic only.
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::SetExitState), &SetExitState_H, (LPVOID*)&SetExitState_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::SetExitState));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::ApplicationQuit), &AppQuit_H, (LPVOID*)&AppQuit_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::ApplicationQuit));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::ApplicationQuit2), &AppQuit2_H, (LPVOID*)&AppQuit2_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::ApplicationQuit2));
+
+			// Rec Room shutdown API -- FatalApplicationQuit carries the reason string.
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::TryApplicationQuit0), &TryQuit0_H, (LPVOID*)&TryQuit0_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::TryApplicationQuit0));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::TryApplicationQuit1), &TryQuit1_H, (LPVOID*)&TryQuit1_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::TryApplicationQuit1));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::FatalApplicationQuit), &FatalQuit_H, (LPVOID*)&FatalQuit_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::FatalApplicationQuit));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::LogoutToBootScene), &Logout_H, (LPVOID*)&Logout_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::LogoutToBootScene));
+
+			MH_CreateHook((void*)(GA + RR::Methods::AppLifecycle::LogoutToBootSceneAsync), &LogoutAsync_H, (LPVOID*)&LogoutAsync_O);
+			MH_EnableHook((void*)(GA + RR::Methods::AppLifecycle::LogoutToBootSceneAsync));
+
+			// Pump probes -- diagnostic only, safe to remove once the blob stall is understood.
+			MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Pump), &Pump_H, (LPVOID*)&Pump_O);
+			MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Pump));
+
+			MH_CreateHook((void*)(GA + RR::Methods::HttpClient::Send), &Send_H, (LPVOID*)&Send_O);
+			MH_EnableHook((void*)(GA + RR::Methods::HttpClient::Send));
+
+			// Photon protocol tracer -- logs every operation sent + every connection status, to diagnose
+			// the game-session join hang against Luxon.
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::SendOperation), &SendOp_H, (LPVOID*)&SendOp_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::SendOperation));
+
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::EnqueueStatusCallback), &EnqStatus_H, (LPVOID*)&EnqStatus_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::EnqueueStatusCallback));
+
+			// Incoming operation-response tracer (both protocol impls; whichever fires reveals the active
+			// serialization AND the server's return codes).
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeOperationResponse), &Deser16_H, (LPVOID*)&Deser16_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeOperationResponse));
+
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeOperationResponse), &Deser18_H, (LPVOID*)&Deser18_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeOperationResponse));
+
+			// Server-pushed events -- covers ErrorInfo (251), the one way Photon could ask us to quit.
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeEventData), &Ev16_H, (LPVOID*)&Ev16_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol16_DeserializeEventData));
+
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeEventData), &Ev18_H, (LPVOID*)&Ev18_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::Protocol18_DeserializeEventData));
+
+		}
+
+		PatchLog("[Patch] hooks installed: Referee x4, TLS, SendRequest, CheatMgr, ImgSig, getaddrinfo, GetAddrInfoW, PhotonConnect%s", RR::Config::EnableTracing ? " + tracing" : "");
+		PatchLog("[Patch] API host=%s  Photon=%s  backend=%s", RR::Config::ApiHost,
+			RR::Config::UsePhotonCloud ? "(cloud)" : RR::Config::PhotonHost,
+			RR::Config::UsePhotonCloud ? "Photon Cloud" : "self-hosted");
 	}
 }

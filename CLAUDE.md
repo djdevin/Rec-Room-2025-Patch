@@ -9,6 +9,12 @@ dead official backend to a mirror (`recflare`): API host rewritten to `ns.recfla
 redirected to `photon.recflare.net`, plus a self-contained Referee (anti-cheat/anti-debug) bypass.
 Ships as an injected DLL and a standalone injector.
 
+**Status: playable.** Boots, logs in, loads the dorm in ~5s, joins arbitrary rooms, and holds a
+session indefinitely. Getting there needed four fixes that are *not* obvious from the code alone —
+the image content-signature bypass, an unblocked+stubbed `datacollection` host, a `StorefrontConfig`
+field in the server's `api/config/v2`, and the CheatManager suppressor. The last two sections below
+exist because each of those presented as a completely different bug than it was.
+
 ## Build
 
 Release|x64 is the only working configuration — see the caveat below.
@@ -73,6 +79,32 @@ This split is the single most load-bearing thing to know, and it is not visible 
 
 So "add a URL rewrite" is not one edit — decide which stack the request travels first.
 
+### The System.Net.Http client is a single serial queue — this dominates load times
+
+`CBACIMLIBPF` does **not** dispatch concurrently. Everything goes through one FIFO:
+
+| RVA | method | stage |
+| --- | --- | --- |
+| `0x7CC4F20` / `0x7CC50D0` | `IBJKIAMJCDN(..., Queue, ...)` | enqueue (`Request10`/`Request9`) |
+| `0x7CC6EA0` | `KOMEOKGFOBP(Queue, ct)` | pump — drains the queue |
+| `0x7CC29E0` | `CJOCHJBHGPM(uint seq, ...)` | one actual send; `seq` is a **global** counter |
+
+Only after `CJOCHJBHGPM` does a request become a BestHTTP request and appear in the `SendRequest`
+hook. The room-save blob sits around **position 100**, and `FetchRoomLoadDetails > getRoomSaveData`
+times out at **30s**, so anything that stalls the queue kills the room load.
+
+⚠️ **A dead host that fails fast is worse than one that answers.** The client retries transport
+failures with backoff *on this queue*. One blocked `data/event` POST retried at ~5.5s and ~13.7s and
+held the queue **24.68s**, pushing the blob to 36.6s and blowing the timeout. Blocking it in DNS
+(`BlockDeadHosts`) did not help — NXDOMAIN and a block are equally bad, because the cost is the
+retry, not the lookup. **Only an instant 2xx stops the backoff.** Stub the endpoint server-side
+first, *then* remove the host from `IsDeadHost`; removing it without a stub just restores NXDOMAIN.
+
+The `[Pump]` / `[Send]` tracers exist to make this visible. To find what starves the queue, diff
+consecutive `[Send]` timestamps and take the single largest gap — it names the blocking request
+directly. And before concluding a request "was never sent", check the log covers enough wall-clock
+after it: for a long time the blob looked undispatched when it was merely 6s late.
+
 ### Calling back into il2cpp
 
 Managed methods are invoked through `spoof_call` (`Utils/deps/spoofcall/`), which hides the DLL's
@@ -99,20 +131,127 @@ whether the hook is masking a different fault. Keep that pattern for new forcing
 
 `PatchLog` (`Utils/Inc/Includes.h`) writes timestamped, per-line-flushed output to `2025patch.log`
 **next to the game exe** — it survives a crash and correlates with Unity's `Player.log` by
-timestamp. The AllocConsole path is off by default (`kEnableConsole` in `main.cpp`): the console
+timestamp. The AllocConsole path is off by default (`EnableConsole` in `2025patch.ini`): the console
 steals foreground focus and Unity throttles hard when unfocused, which measurably wrecked room-load
 times. `std::cout` calls therefore go nowhere; every one of them is mirrored by a `PatchLog` line,
 and new diagnostics should use `PatchLog`.
 
+`Patch()` is split accordingly: the load-bearing hooks install unconditionally — Referee x4, the TLS
+`NotifyServerCertificate` no-op, `SendRequest_H` (host rewrite), `CheatQuit_H`, `VerifyImageSig_H`,
+the two winsock DNS hooks and `ConnectUsingSettings_H` — while all 19 diagnostic hooks live in one
+`if (RR::Config::EnableTracing)` block and are not installed at all when it is off. Routine
+per-request chatter uses the `TraceLog` macro (a no-op unless tracing is on) so `SendRequest_H` stays
+quiet without losing the rewrite; genuine anomalies there still use `PatchLog` unconditionally.
+
+The tracers are kept rather than deleted deliberately — see the findings-log convention below. They
+are the only way this project has ever seen inside the serial request queue or caught a server-pushed
+Photon event, and each carries the comment block explaining what it answered.
+
+`VerifyImageSig_H` deserves a note: mirrored `img.` assets still carry rec.net's original
+`content-signature: key-id=KEY:RSA:p1.rec.net` header (that is what `?sig=p1` selects), and the
+client verifies it against a baked-in public key. **No mirror can ever satisfy it** — signing needs
+Rec Room's private key — so the check is unsatisfiable by construction rather than merely failing.
+The throw used to hard-stall the shared request pump, which is why it broke room loading and not
+just artwork.
+
 ## Configuration knobs
 
-All compile-time constants, no config file:
+### Runtime — `2025patch.ini`, next to the game exe
 
-- `UsePhotonCloud` (Patches.h) — `false` targets the self-hosted server and enables the DNS
-  redirect; `true` skips the redirect and injects the `CloudAppId*` GUIDs into `AppSettings` just
-  before connect, for A/B testing against real Photon Cloud.
-- `PhotonHost`, `CloudAppId*`, `CloudFixedRegion` (Patches.h).
-- `kEnableConsole` (main.cpp).
+Read at attach by `RR::Config::Load()` (`2025Patch/src/RR/Config.h`), called from `DllMain`
+**before** `Resolve()`/`Patch()` so the first request and first DNS lookup already see it. One
+`[config]` section:
+
+| key | default | effect |
+| --- | --- | --- |
+| `ApiHost` | `ns.recflare.net` | replaces `ns.rec.net` in BestHTTP request URIs |
+| `PhotonHost` | `photon.recflare.net` | `getaddrinfo` target for `*.photonengine` / `exitgames` / `photonindustries` |
+| `UsePhotonCloud` | `false` | `false` = self-hosted (DNS redirect on); `true` = real Photon Cloud (redirect off, `CloudAppId*` injected into `AppSettings`) |
+| `PhotonPort` | `0` | self-hosted only; overrides `AppSettings.Port` for the initial connect. `0` = leave the supplied port |
+| `EnableConsole` | `false` | AllocConsole debug window. Costs load time (focus theft → Unity throttling); everything it prints is already in `2025patch.log` |
+| `BlockDeadHosts` | `true` | `getaddrinfo` returns `WSAHOST_NOT_FOUND` for `IsDeadHost` matches. **Third-party hosts only** — rudderstack, backtrace, statsig, `cloud.unity3d.com`. Most are still *live*, so this is as much about not shipping an archival session's telemetry and crash dumps to unrelated companies as it is about latency. Never list a `*.recflare.net` host: see the serial-queue warning above |
+| `EnableTracing` | `false` | Installs the diagnostic hooks ([Pump]/[Send] queue probes, Photon operation/status/event tracers, HttpClient paths, BestHTTP responses) and un-quiets `SendRequest`'s per-request lines. Off = none of them are hooked at all |
+| `CloudAppIdRealtime` / `CloudAppIdVoice` / `CloudAppIdChat` | the dashboard GUIDs | Cloud only; empty keeps the server-supplied id |
+| `CloudFixedRegion` | *(empty)* | Cloud only; e.g. `us`. Empty = pick via name server |
+
+The file is created with these defaults on first run if absent, and never overwritten afterwards.
+Host values are sanitized to a bare host (scheme and path stripped) because `PhotonHost` is a
+`getaddrinfo` node name, not a URL. Malformed input never leaves the patch in a broken state: a
+blank host, a non-boolean flag, or an out-of-range port logs a line and keeps the default (a
+non-numeric port reads as `0`, i.e. "leave it alone"). Empty *is* honoured for the app ids and
+region, where it means "keep what the server sent". Booleans accept `true/false`, `1/0`, `yes/no`,
+`on/off`. The effective set is logged as `[Config] ...`, plus `[Patch] API host=... backend=...`.
+
+`PhotonPort` has to go through `AppSettings` rather than the DNS hooks — a port never passes through
+`getaddrinfo` — so it is applied in `ConnectUsingSettings_H`, and the master still hands out its own
+game-server ports afterwards.
+
+Not configurable: the host being *matched* (`ns.rec.net`) and the Photon-name substrings in
+`IsPhotonHost`, both still literals in Patches.h. A pre-rename ini using `[hosts]` applies nothing —
+`Load()` detects that case and logs `ignoring legacy [hosts] section`.
+
+`Load()` runs before `CreateConsole()` in `DllMain` — it now decides whether the console exists at
+all. `PatchLog` is file-based, so the `[Config]` lines are recorded either way.
+
+Nothing is compile-time any more; every knob lives in the ini.
+
+## When the client exits on its own, suspect CheatManager first
+
+`CheatManager` (Assembly-CSharp; the class name is **not** obfuscated) periodically enumerates loaded
+modules, strips the app directory from each path, formats them `[index:name]`, and calls a closure
+whose entire body is `SessionManager.FatalApplicationQuit(533223478, filenames)`. It finds
+`2025Patch.dll`. `RR::Methods::AntiCheat::ModuleScanDetected` (`0x2148FB0`) is hooked **replace-only**
+to suppress it — never call the original.
+
+**This is worth its own section because the symptom lies.** It presents as a completely clean user
+quit: `crash_detected=false`, `app_exit_state=ReadyForExit`, orderly Photon `Leave`, `player/logout`,
+full `Application.quit`. The timing varies with the scan (40s–140s), so it also reads as a timeout.
+Everything you would naturally blame is *downstream* of the decision — `player/logout` lands 0.14s
+**after** it, and `RaiseEvent(...) failed` / `Unable to send message!` are teardown noise. Photon is
+innocent (the `DeserializeEventData` tracer shows zero `ErrorInfo` (251) events).
+
+Note this suppresses the *reaction*, not the detection — the scan still finds us every cycle. PEB
+loader-list unlinking (`../recnet-patcher/src/memory/module_hide.c`) would defeat it at the source
+and is the better fix if the scan ever grows a second consumer.
+
+**Re-finding it after a build rolls:** `533223478` (`0x1FC85836`) is a hardcoded constant, not a
+dynamic reason code. Scan `GameAssembly.dll` for the immediate `B9 36 58 C8 1F` (`mov ecx, imm32`) —
+it gave exactly one hit and landed straight in the call site. Do that before walking any stacks.
+
+Related: `SessionManager` keeps most of its real names (`FatalApplicationQuit`, `TryApplicationQuit`,
+`LogoutToBootScene`, `VerifyAccountRequirements`, `HandleRoomJoinFailure`, `DefaultRoomGatesAsync`,
+`JuniorRoomCheck`) — dump them from `methods.pkl` by the `SessionManager$$` prefix. Its
+`FatalApplicationQuit` body **ignores the message argument** (it tail-jumps to `TryApplicationQuit`
+with the code only), so read the message at the *caller*, not from a hook on it.
+
+## Resolving addresses and wire shapes on this build
+
+The tooling lives in `../recnet-patcher/il2cpp-2025/` and there are two indexes with different
+coverage — use the right one:
+
+- **`methods.pkl`** (346,938 methods, from a live carve) is the more complete index and is the only
+  one that covers **UnityEngine** — that is how `Application.Quit` and
+  `Internal_ApplicationWantsToQuit` were located. Look up an RVA with a `bisect` over the sorted
+  table; a large `+0x` delta means "not really inside that method", not a hit.
+- **`RecRoom_Info/Code/2025-07-19_02-45-25`** (Cpp2IL, 241,704 methods) has type/field structure and
+  attributes but is **signature-only** — no bodies, no string literals. Verify it with
+  `SendRequest = 0x77E0950`. `../recnet-patcher/il2cpp-tools/out/` is a **different, older build**;
+  it has `dump.cs` but zero hits for this build's type names.
+
+Because there is no `dump.cs` for this build, `dtoshape.py` cannot run. To get Utf8Json wire keys,
+find `XXXX : IHCMHKGLBEA<Dto>` in the Cpp2IL dump, take its ctor RVA, and run
+`py names.py <ctor> 1200` with `GAMEASSEMBLY` pointed at
+`../recnet-patcher/tools/metadump/out/GameAssembly.dll`. The trailing `mov` block is
+`____stringByteKeys` — one entry per member, in declaration order. That is how the missing
+`StorefrontConfig` field in `api/config/v2` was identified.
+
+`whatis2025.py` defaults to the **wrong (2025-04-29) dump** — always pass
+`--dump C:\Games\RecRoom_Info\Code\2025-07-19_02-45-25`.
+
+The stack tracers (`LogStack`) print `module+offset` for every frame; feed the `GameAssembly.dll+0x…`
+values into the lookups above. Frames below the lowest managed RVA (`0xA5F110`) are il2cpp runtime
+plumbing, and a chain of them means the call arrived via `runtime_invoke` — i.e. from a delegate or
+event handler, so there is no static caller to find.
 
 ## Investigation notes in comments
 

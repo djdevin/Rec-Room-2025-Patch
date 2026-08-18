@@ -62,6 +62,21 @@ namespace RR::Methods::Photon {
 namespace RR::Methods::HttpClient {
 	uintptr_t Request9  = 0x7CC50D0;  // IBJKIAMJCDN(HttpMethod, service, path, ...) 9 params
 	uintptr_t Request10 = 0x7CC4F20;  // IBJKIAMJCDN(HttpMethod, service, path, ..., Queue) 10 params
+
+	// The two stages BELOW the enqueue, for locating where a request dies.
+	//
+	// CBACIMLIBPF dispatches in three steps: IBJKIAMJCDN puts the request on a shared Queue,
+	// KOMEOKGFOBP drains that queue, and CJOCHJBHGPM performs one actual send (its uint first arg is
+	// the attempt number, so retries are visible). Only after CJOCHJBHGPM does it become a real
+	// BestHTTP request and show up in our SendRequest hook.
+	//
+	// This matters because the room-save blob is logged by the Request9/10 hook and then never
+	// appears in SendRequest -- and we PROVED it is not slipping out via some other transport: every
+	// one of the 177 [HTTP<-] responses in the 2026-08-17 run matched a SendRequest, zero unmatched.
+	// So it dies inside these two. Pump reached but not Send => stuck in the queue. Send reached but
+	// no SendRequest => dying below the send.
+	uintptr_t Pump = 0x7CC6EA0;  // KOMEOKGFOBP(Queue<CPPAPPOPHFD>, CancellationToken)
+	uintptr_t Send = 0x7CC29E0;  // CJOCHJBHGPM(uint attempt, HttpMethod, service, path, ...)
 }
 
 // Field offsets from the runtime dump (build 19/07/25), for the response logger.
@@ -94,6 +109,64 @@ namespace RR::Offsets {
 namespace RR::Methods::ImageSignature {
 	uintptr_t Verify    = 0x7CF32F0;  // BLDFMLMAFLH(byte[] data, byte[] sig) -> bool
 	uintptr_t PublicKey = 0x7CF84E0;  // OGONMIPNEKK() -> RSAParameters   (not hooked; for reference)
+}
+
+// AppExitState setter -- PGEBFPENFNN.set_MNMHGMIGNCP(MJNGPKFGDEA) in Assembly-CSharp.
+//
+// This is the method that emits "AppExitState changed: X => Y" (the dump still carries the
+// interpolated string in its body, which is how it was identified despite the obfuscated name).
+// Enum: 0=Running, 1=PreparingToExit, 2=ReadyForExit.
+//
+// Hooked purely to answer "who asked the client to quit". The client exits CLEANLY -- its own
+// telemetry reports app_exit_state=ReadyForExit, crash_detected=false -- so it is not a crash;
+// something calls this. A native stack capture at the transition names the caller, which beats
+// inferring it from whatever error happened to be logged nearby (an NRE fires ~0.65s before, but the
+// same NRE also fires repeatedly WITHOUT an exit, so proximity alone proves nothing).
+namespace RR::Methods::AppLifecycle {
+	uintptr_t SetExitState = 0x21498B0;
+
+	// UnityEngine.Application.Quit() and Quit(int). RVAs from il2cpp-2025/methods.pkl -- UnityEngine
+	// is NOT in the Cpp2IL dump, but the live-carve index covers it (346,938 methods vs 241,704).
+	// Hooked to distinguish a managed quit request from an OS window-close; see AppQuit_H.
+	uintptr_t ApplicationQuit  = 0x99584D0;
+	uintptr_t ApplicationQuit2 = 0x9958510;
+	// For reference, not hooked: Internal_ApplicationWantsToQuit = 0x99581E0 (where the exit stack
+	// enters managed code), Internal_ApplicationQuit = 0x9958140.
+
+	// Rec Room's own shutdown API. This class is UNOBFUSCATED, which is a gift -- the stack from the
+	// Application.Quit hook landed in its async helper NFIGOBHOJIF(int) @0x2174B00, so the quit is
+	// requested by game logic, and one of these entry points carries the reason.
+	// FatalApplicationQuit takes an int code AND a message string; that message is the whole answer.
+	// LogoutToBootScene* matter because the observed symptom is "it auto logs out, then quits".
+	uintptr_t TryApplicationQuit0    = 0x2177A00;  // TryApplicationQuit()
+	uintptr_t TryApplicationQuit1    = 0x2177880;  // TryApplicationQuit(int)
+	uintptr_t FatalApplicationQuit   = 0x2170A70;  // FatalApplicationQuit(int, string)
+	uintptr_t LogoutToBootScene      = 0x2174650;  // LogoutToBootScene()
+	uintptr_t LogoutToBootSceneAsync = 0x2174590;  // LogoutToBootSceneAsync()
+}
+
+// ANTI-CHEAT MODULE SCAN -- the reason the client "auto logs out and quits" while sitting idle.
+//
+// CheatManager (Assembly-CSharp, class name NOT obfuscated) enumerates loaded modules, strips the
+// app directory from each path (its sibling closure JFOAEHOCCIN.EAMAJENBDLL does `s.Replace(appPath,
+// "")`), formats the survivors as "[index:name]", and hands them to this callback:
+//
+//     private sealed class LFKHKEPJKMB {          // compiler-generated closure
+//         public string filenames;                //  field @0x10
+//         internal void LOELLDBOINB() {
+//             SessionManager.FatalApplicationQuit(533223478, filenames);
+//         }
+//     }
+//
+// Confirmed at runtime 2026-08-17: it fired with filenames = "[0:2025Patch.dll]" -- our own injected
+// DLL -- 30ms before AppExitState went to PreparingToExit. That is why the quit looked orderly, why
+// no server-side fix ever touched it, and why Photon/logout/RaiseEvent were all downstream noise.
+//
+// 533223478 (0x1FC85836) is a fixed constant baked into LOELLDBOINB, not a dynamic reason code; it
+// ends up as the process exit code via Application.Quit(int). Searching the binary for that immediate
+// is what located this call site, and it is the fastest way to re-find it after a build rolls.
+namespace RR::Methods::AntiCheat {
+	uintptr_t ModuleScanDetected = 0x2148FB0;  // CheatManager+LFKHKEPJKMB.LOELLDBOINB()
 }
 
 namespace RR::Methods::System::Uri {

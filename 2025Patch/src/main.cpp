@@ -17,10 +17,8 @@ static BOOL CALLBACK FindGameWindowProc(HWND hwnd, LPARAM) {
     return TRUE;
 }
 
-// The console is OFF by default -- flip to true only for live poking, and expect it to cost you
-// load time. Rationale below.
-static constexpr bool kEnableConsole = false;
-
+// The console is OFF by default -- set EnableConsole=true in 2025patch.ini only for live poking,
+// and expect it to cost you load time. Rationale below.
 void CreateConsole() {
     // AllocConsole creates a console window that grabs the foreground, and Unity throttles the game
     // to a crawl the instant its window loses focus. Handing the foreground straight back (below)
@@ -33,8 +31,8 @@ void CreateConsole() {
     // flushed per line, and survives a crash. So default to not creating a window at all -- there is
     // no focus to steal if there is no window. The std::cout calls in Patches.h then write to an
     // unopened stdout, which is a silent no-op; each is already mirrored by a PatchLog line.
-    if (!kEnableConsole) {
-        PatchLog("[Console] disabled (kEnableConsole=false); diagnostics -> 2025patch.log only");
+    if (!RR::Config::EnableConsole) {
+        PatchLog("[Console] disabled (EnableConsole=false); diagnostics -> 2025patch.log only");
         return;
     }
 
@@ -64,6 +62,11 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpRese
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
+        // Config first: it comes from 2025patch.ini next to the game exe and is read before any hook
+        // exists, so the first request/DNS lookup already sees the configured backend -- and before
+        // CreateConsole, which is now one of the things it decides. PatchLog is file-based, so the
+        // config lines are recorded either way.
+        RR::Config::Load();
         CreateConsole();
         PatchLog("[DllMain] attached, resolving + patching");
         RR::Patches::Resolve();
