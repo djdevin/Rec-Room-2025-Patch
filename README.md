@@ -2,6 +2,8 @@
 
 Fork of https://github.com/Carpetsoft/Rec-Room-2025-Patch
 
+Compatible with build 20250718.01 (19 July 2025), Steam manifest 1151455856673601091.
+
 - Disabled image signing, no need for sigs
 - Added logging to investigate a Photon issue (probably remove later)
 - Added custom .DLL injector
