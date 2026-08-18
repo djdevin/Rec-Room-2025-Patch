@@ -6,6 +6,24 @@ Fork of https://github.com/Carpetsoft/Rec-Room-2025-Patch
 - Added logging to investigate a Photon issue (probably remove later)
 - Added custom .DLL injector
 
+## Launching
+
+The release zip unpacks into the Rec Room folder (the one with `Recroom_Release.exe`) as a flat
+set: `2025Patch.dll`, `Injector.exe`, `2025patch.ini`, `RecRoomScreen.bat`, `RecRoomVR.bat`.
+
+Run `RecRoomScreen.bat` (desktop) or `RecRoomVR.bat` (VR). Each starts `Injector.exe` first -- it
+waits for `Recroom_Release.exe` and for `GameAssembly.dll` + `Referee.dll` to load before attaching
+-- then launches the game with `+forcemode:screen` / `+forcemode:vr`. Both resolve every path
+relative to themselves, so they only work from the game folder, and both refuse to do anything if
+`Injector.exe` or `Recroom_Release.exe` is not sitting next to them.
+
+Injecting by hand works the same way: start `Injector.exe`, then the game. The injector will not
+double-inject, so re-running a launcher against a running game is a no-op.
+
+There is no console window by default (Unity throttles the game whenever it loses focus, which
+costs real room-load time) -- check `2025patch.log` in the game folder to confirm the patch
+attached, or set `EnableConsole=true` in `2025patch.ini`.
+
 ## Configuration
 
 `2025patch.ini` in this repo is a ready-to-use example carrying the built-in defaults, and it

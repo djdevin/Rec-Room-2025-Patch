@@ -1,2 +1,5 @@
 # INI is read with GetPrivateProfileString, which wants CRLF line endings.
 *.ini text eol=crlf
+
+# Batch files are parsed line-by-line by cmd.exe, which wants CRLF.
+*.bat text eol=crlf

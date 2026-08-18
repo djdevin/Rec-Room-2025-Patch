@@ -28,6 +28,13 @@ Both projects write to the solution-level `x64/Release/`: `2025Patch.dll` and `I
 Ship the two side by side; the injector defaults to `2025Patch.dll` next to itself (or takes a path
 as argv[1]).
 
+`RecRoomScreen.bat` / `RecRoomVR.bat` at the repo root are the shipped one-click launchers: `cd /d
+"%~dp0"`, start `Injector.exe`, then `Recroom_Release.exe +forcemode:screen|vr`. They are staged
+into `x64/Release/` by the CI workflow and packed into the release zip alongside the ini, so the
+zip unpacks into the game folder as a flat drop-in set — **everything they reference is relative,
+so they only work from that folder**, and they are two copies of one script differing in the
+`forcemode` argument: change one, change the other.
+
 There is no test suite, linter, or CI. Verification is empirical: run the game, read
 `2025patch.log`.
 
@@ -176,8 +183,8 @@ Read at attach by `RR::Config::Load()` (`2025Patch/src/RR/Config.h`), called fro
 
 The file is created with these defaults on first run if absent, and never overwritten afterwards.
 A byte-identical copy lives at the repo root as `2025patch.ini` and is staged into `x64/Release/` by
-the CI workflow so it ends up in the release zip beside the DLL and injector — **when you change
-`WriteDefaultFile`, change that file too**, or the shipped example drifts from what the patch writes.
+the CI workflow (together with the two `.bat` launchers) so it ends up in the release zip beside the
+DLL and injector — **when you change `WriteDefaultFile`, change that file too**, or the shipped example drifts from what the patch writes.
 
 Host values are sanitized to a bare host (scheme and path stripped) because `PhotonHost` is a
 `getaddrinfo` node name, not a URL. Malformed input never leaves the patch in a broken state: a

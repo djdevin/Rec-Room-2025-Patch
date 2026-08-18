@@ -131,3 +131,4 @@ if ($missing.Count -gt 0) {
 
 Write-Host ''
 Write-Host 'Ship 2025Patch.dll and Injector.exe side by side; the injector defaults to 2025Patch.dll next to itself.'
+Write-Host 'RecRoomScreen.bat / RecRoomVR.bat (repo root) go in the game folder and start the injector, then the game.'
