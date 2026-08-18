@@ -26,6 +26,14 @@ jobs:
         shell: pwsh
         run: .\build.ps1 -Verbosity minimal
 
+      # The example ini is the same text Config::WriteDefaultFile emits on first run, so
+      # shipping it only saves the user a first launch to discover the knobs. Staged into
+      # the build output so the artifact -- and the release zip built from it -- is one flat
+      # drop-in set, and the release job needs no second checkout.
+      - name: Stage example config
+        shell: pwsh
+        run: Copy-Item 2025patch.ini x64\Release\
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -34,6 +42,7 @@ jobs:
           path: |
             x64/Release/2025Patch.dll
             x64/Release/Injector.exe
+            x64/Release/2025patch.ini
             x64/Release/2025Patch.pdb
             x64/Release/Injector.pdb
 
@@ -55,7 +64,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\2025Patch.dll, dist\Injector.exe `
+          Compress-Archive -Path dist\2025Patch.dll, dist\Injector.exe, dist\2025patch.ini `
             -DestinationPath "2025Patch-$env:GITHUB_REF_NAME-x64.zip"
 
       - name: Create release

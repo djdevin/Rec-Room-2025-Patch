@@ -175,6 +175,10 @@ Read at attach by `RR::Config::Load()` (`2025Patch/src/RR/Config.h`), called fro
 | `CloudFixedRegion` | *(empty)* | Cloud only; e.g. `us`. Empty = pick via name server |
 
 The file is created with these defaults on first run if absent, and never overwritten afterwards.
+A byte-identical copy lives at the repo root as `2025patch.ini` and is staged into `x64/Release/` by
+the CI workflow so it ends up in the release zip beside the DLL and injector — **when you change
+`WriteDefaultFile`, change that file too**, or the shipped example drifts from what the patch writes.
+
 Host values are sanitized to a bare host (scheme and path stripped) because `PhotonHost` is a
 `getaddrinfo` node name, not a URL. Malformed input never leaves the patch in a broken state: a
 blank host, a non-boolean flag, or an out-of-range port logs a line and keeps the default (a
