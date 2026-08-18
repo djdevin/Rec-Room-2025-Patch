@@ -24,17 +24,19 @@ namespace RR::Config {
 
 	// --- Defaults: the recflare mirror, self-hosted Photon. In effect when there is no ini/value. ---
 
-	char ApiHost[128]    = "ns.recflare.net";      // replaces ns.rec.net in BestHTTP request URIs
-	char PhotonHost[128] = "photon.recflare.net";  // getaddrinfo target for *.photonengine / exitgames
+	char ApiHost[128] = "ns.recflare.net";  // replaces ns.rec.net in BestHTTP request URIs
 
-	// false -> self-hosted Photon: DNS for the Photon name server is redirected to PhotonHost.
-	// true  -> real Photon Cloud: the DNS redirect is skipped so ns.exitgames.com resolves normally,
-	//          and the CloudAppId* values below are injected into AppSettings just before connect
-	//          (the server-supplied ids belong to the self-hosted deployment and are invalid on
-	//          Cloud). See the PHOTON BACKEND SELECTION block in Patches.h for what this test found.
-	bool UsePhotonCloud = false;
+	// getaddrinfo target for *.photonengine / exitgames / photonindustries.
+	//
+	// EMPTY IS THE OFF SWITCH for everything Photon: no DNS redirect, no AppSettings write, and the
+	// ConnectUsingSettings hook is not even installed -- the client talks to whatever Photon server
+	// its backend hands it, untouched. There is nothing else to configure, because this client takes
+	// its Photon app ids from an endpoint on the server rather than from AppSettings (see the PHOTON
+	// BACKEND SELECTION block in Patches.h), so pointing it at a different Photon deployment is
+	// purely a matter of swapping the server -- which is exactly what this one value does.
+	char PhotonHost[128] = "photon.recflare.net";
 
-	// Self-hosted only. 0 = leave whatever the server/client supplied. This is the port of the
+	// Requires PhotonHost. 0 = leave whatever the server/client supplied. This is the port of the
 	// INITIAL connect (name server / master); the master still hands out its own game-server ports.
 	int PhotonPort = 0;
 
@@ -50,6 +52,10 @@ namespace RR::Config {
 	// an archival session's telemetry and crash dumps to unrelated companies as it is about latency.
 	// true = fail those lookups instantly at the getaddrinfo hook. Substrings are IsDeadHost in Patches.h.
 	//
+	// Backtrace is the one entry that is load-bearing rather than hygiene: its crash-upload backlog
+	// starves the serial request queue until Photon disconnects (the ~50s silence then "Unable to
+	// send message!"). Turning this off brings that back.
+	//
 	// ⚠️ Only ever list hosts that are genuinely external and unwanted. Blocking a *.recflare.net host
 	// does NOT help: the client retries transport failures with backoff on the single serial
 	// System.Net.Http queue, so a blocked host costs the same as an unreachable one. Only a real,
@@ -62,12 +68,6 @@ namespace RR::Config {
 	// blocks beside each hook. Kept rather than deleted because they are the only way this project has
 	// ever managed to see inside the serial request queue or catch a server-pushed Photon event.
 	bool EnableTracing = false;
-
-	// Cloud only (UsePhotonCloud=true). Empty = keep the server-supplied value for that one.
-	char CloudAppIdRealtime[64] = "8f322bdb-2b1f-4c27-a232-01436f43d14e";  // Photon Realtime / PUN
-	char CloudAppIdVoice[64]    = "6b4682e1-a1a9-4e04-b44a-6db0049a4df3";  // Photon Voice
-	char CloudAppIdChat[64]     = "55fae86e-0459-4f97-bf6c-39c9341da6ef";  // Photon Chat
-	char CloudFixedRegion[32]   = "";  // e.g. "us"; empty = let the client pick via name server
 
 	// Path to the ini, next to the game exe (Recroom_Release.exe) -- NOT the DLL and not the CWD.
 	// GetPrivateProfileString requires a full path; given a bare name it searches the Windows
@@ -101,7 +101,9 @@ namespace RR::Config {
 		return *s != '\0';
 	}
 
-	// Current value doubles as the default, so an absent key always keeps it.
+	// Current value doubles as the default, so an absent key always keeps it. The length check is
+	// not cosmetic: buf is wider than the destinations, and strcpy_s ABORTS the process on overflow
+	// rather than truncating, so an over-long value has to be rejected like any other bad input.
 	static void ReadHost(const char* path, const char* key, char* value, size_t cch) {
 		char buf[256] = {};
 		GetPrivateProfileStringA(kSection, key, value, buf, (DWORD)sizeof(buf), path);
@@ -109,17 +111,35 @@ namespace RR::Config {
 			PatchLog("[Config] %s is blank/invalid, keeping default %s", key, value);
 			return;
 		}
+		if (strlen(buf) >= cch) {
+			PatchLog("[Config] %s is too long (%zu chars), keeping default %s", key, strlen(buf), value);
+			return;
+		}
 		strcpy_s(value, cch, buf);
 	}
 
-	// For the app ids and the region, where EMPTY IS MEANINGFUL ("keep whatever the server sent") --
-	// so unlike a host, a blank value is honoured rather than replaced by the default.
-	static void ReadString(const char* path, const char* key, char* value, size_t cch) {
+	// PhotonHost is the one host where EMPTY IS MEANINGFUL: it is the master switch for the Photon
+	// swap, so "PhotonHost=" must CLEAR the default rather than keep it. The three cases are distinct
+	// on purpose -- the key being absent still keeps the default (GetPrivateProfileString hands back
+	// the default we pass in), while a value that is present but non-blank and still sanitizes to
+	// nothing ("https://") is malformed input, not an opt-out, and keeps the default too.
+	static void ReadPhotonHost(const char* path, char* value, size_t cch) {
 		char buf[256] = {};
-		GetPrivateProfileStringA(kSection, key, value, buf, (DWORD)sizeof(buf), path);
-		Trim(buf);
+		GetPrivateProfileStringA(kSection, "PhotonHost", value, buf, (DWORD)sizeof(buf), path);
+		char raw[256] = {};
+		strcpy_s(raw, buf);
+		Trim(raw);
+		if (!*raw) {
+			PatchLog("[Config] PhotonHost is empty -- leaving Photon untouched");
+			*value = '\0';
+			return;
+		}
+		if (!SanitizeHost(buf)) {
+			PatchLog("[Config] PhotonHost is invalid, keeping default %s", value);
+			return;
+		}
 		if (strlen(buf) >= cch) {
-			PatchLog("[Config] %s is too long (%zu chars), keeping default", key, strlen(buf));
+			PatchLog("[Config] PhotonHost is too long (%zu chars), keeping default %s", strlen(buf), value);
 			return;
 		}
 		strcpy_s(value, cch, buf);
@@ -163,14 +183,13 @@ namespace RR::Config {
 			"; Backend hosts. Bare host names -- no scheme, no path.\n"
 			"; ApiHost rewrites ns.rec.net in the game's API requests.\n"
 			"ApiHost=%s\n"
+			"\n"
 			"; PhotonHost is the DNS target for Photon (*.photonengine / exitgames / photonindustries).\n"
+			"; Leave it EMPTY to make no Photon changes at all -- the client then connects to whatever\n"
+			"; Photon server its backend gives it. The app ids always come from the server.\n"
 			"PhotonHost=%s\n"
 			"\n"
-			"; false = self-hosted Photon (PhotonHost above). true = real Photon Cloud: the DNS\n"
-			"; redirect is skipped and the CloudAppId* values below are used instead.\n"
-			"UsePhotonCloud=%s\n"
-			"\n"
-			"; Self-hosted only. Port of the initial Photon connect; 0 = leave the supplied port.\n"
+			"; Requires PhotonHost. Port of the initial Photon connect; 0 = leave the supplied port.\n"
 			"PhotonPort=%d\n"
 			"\n"
 			"; Debug console window. Costs load time -- it steals focus and Unity throttles while\n"
@@ -184,18 +203,10 @@ namespace RR::Config {
 			"\n"
 			"; Verbose diagnostic tracing: request-pump probes, Photon operation/event tracers,\n"
 			"; HttpClient paths, BestHTTP responses. Chatty; only needed when investigating.\n"
-			"EnableTracing=%s\n"
-			"\n"
-			"; Photon Cloud only (UsePhotonCloud=true). Empty = keep the server-supplied value.\n"
-			"CloudAppIdRealtime=%s\n"
-			"CloudAppIdVoice=%s\n"
-			"CloudAppIdChat=%s\n"
-			"; e.g. us -- empty lets the client pick a region via the name server.\n"
-			"CloudFixedRegion=%s\n",
-			kSection, ApiHost, PhotonHost, UsePhotonCloud ? "true" : "false", PhotonPort,
+			"EnableTracing=%s\n",
+			kSection, ApiHost, PhotonHost, PhotonPort,
 			EnableConsole ? "true" : "false", BlockDeadHosts ? "true" : "false",
-			EnableTracing ? "true" : "false",
-			CloudAppIdRealtime, CloudAppIdVoice, CloudAppIdChat, CloudFixedRegion);
+			EnableTracing ? "true" : "false");
 		fclose(f);
 	}
 
@@ -214,27 +225,17 @@ namespace RR::Config {
 		GetPrivateProfileStringA("hosts", "ApiHost", "", legacy, (DWORD)sizeof(legacy), path);
 		if (*legacy) PatchLog("[Config] ignoring legacy [hosts] section -- rename it to [%s]", kSection);
 
-		ReadHost(path, "ApiHost",    ApiHost,    sizeof(ApiHost));
-		ReadHost(path, "PhotonHost", PhotonHost, sizeof(PhotonHost));
-		ReadBool(path, "UsePhotonCloud", UsePhotonCloud);
+		ReadHost(path, "ApiHost", ApiHost, sizeof(ApiHost));
+		ReadPhotonHost(path, PhotonHost, sizeof(PhotonHost));
 		ReadBool(path, "EnableConsole",  EnableConsole);
 		ReadBool(path, "BlockDeadHosts", BlockDeadHosts);
 		ReadBool(path, "EnableTracing",  EnableTracing);
 		ReadPort(path, "PhotonPort",     PhotonPort);
-		ReadString(path, "CloudAppIdRealtime", CloudAppIdRealtime, sizeof(CloudAppIdRealtime));
-		ReadString(path, "CloudAppIdVoice",    CloudAppIdVoice,    sizeof(CloudAppIdVoice));
-		ReadString(path, "CloudAppIdChat",     CloudAppIdChat,     sizeof(CloudAppIdChat));
-		ReadString(path, "CloudFixedRegion",   CloudFixedRegion,   sizeof(CloudFixedRegion));
 
 		PatchLog("[Config] %s", path);
-		PatchLog("[Config] ApiHost=%s PhotonHost=%s UsePhotonCloud=%s PhotonPort=%d EnableConsole=%s BlockDeadHosts=%s EnableTracing=%s",
-			ApiHost, PhotonHost, UsePhotonCloud ? "true" : "false", PhotonPort,
+		PatchLog("[Config] ApiHost=%s PhotonHost=%s PhotonPort=%d EnableConsole=%s BlockDeadHosts=%s EnableTracing=%s",
+			ApiHost, *PhotonHost ? PhotonHost : "(none -- Photon untouched)", PhotonPort,
 			EnableConsole ? "true" : "false", BlockDeadHosts ? "true" : "false",
 			EnableTracing ? "true" : "false");
-		if (UsePhotonCloud) {
-			PatchLog("[Config] CloudAppIdRealtime=%s Voice=%s Chat=%s FixedRegion=%s",
-				CloudAppIdRealtime, CloudAppIdVoice, CloudAppIdChat,
-				*CloudFixedRegion ? CloudFixedRegion : "(server-supplied)");
-		}
 	}
 }

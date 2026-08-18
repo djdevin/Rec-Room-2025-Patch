@@ -23,6 +23,9 @@ namespace RR::Methods::HTTPRequest {
 // Photon.Realtime.AppSettings -- the settings object the client hands to its connect call. Field
 // offsets from the runtime dump (build 19/07/25); these names are NOT obfuscated.
 namespace RR::Offsets::AppSettings {
+	// Only Port is written (PhotonPort); the rest are mapped for reference. In particular the three
+	// AppId fields are NOT ours to set -- this client takes its Photon app ids from an endpoint on
+	// the server, not from AppSettings.
 	constexpr int AppIdRealtime  = 16;   // Il2CppString*
 	constexpr int AppIdChat      = 24;   // Il2CppString*
 	constexpr int AppIdVoice     = 32;   // Il2CppString*
@@ -33,9 +36,9 @@ namespace RR::Offsets::AppSettings {
 	constexpr int Port           = 80;   // int32
 }
 
-// OLPEILEPEAD.JBNCMFDFDLM(AppSettings) -- the "ConnectUsingSettings" seam. Hooking it lets us
-// rewrite the app ids (and region/nameserver) immediately before the client connects, which is how
-// we point the client at Photon Cloud instead of the self-hosted server.
+// OLPEILEPEAD.JBNCMFDFDLM(AppSettings) -- the "ConnectUsingSettings" seam. Hooking it lets us set
+// the connect port immediately before the client connects; the host itself is swapped at the DNS
+// layer instead. Only hooked when PhotonHost and PhotonPort are both configured.
 namespace RR::Methods::Photon {
 	uintptr_t ConnectUsingSettings = 0x757E8C0;
 }

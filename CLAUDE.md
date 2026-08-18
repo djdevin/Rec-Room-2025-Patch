@@ -19,6 +19,13 @@ exist because each of those presented as a completely different bug than it was.
 
 Release|x64 is the only working configuration — see the caveat below.
 
+```powershell
+.\build.ps1                 # also: -Rebuild, -Clean, -Verbosity normal
+```
+
+`build.ps1` finds MSBuild via vswhere and is what CI runs too, so the two stay one source of truth.
+Straight MSBuild works and is what the tooling notes below assume:
+
 ```bash
 "C:/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe" \
   2025Patch.sln /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
@@ -28,15 +35,18 @@ Both projects write to the solution-level `x64/Release/`: `2025Patch.dll` and `I
 Ship the two side by side; the injector defaults to `2025Patch.dll` next to itself (or takes a path
 as argv[1]).
 
-`RecRoomScreen.bat` / `RecRoomVR.bat` at the repo root are the shipped one-click launchers: `cd /d
-"%~dp0"`, start `Injector.exe`, then `Recroom_Release.exe +forcemode:screen|vr`. They are staged
-into `x64/Release/` by the CI workflow and packed into the release zip alongside the ini, so the
-zip unpacks into the game folder as a flat drop-in set — **everything they reference is relative,
-so they only work from that folder**, and they are two copies of one script differing in the
-`forcemode` argument: change one, change the other.
+After a successful build `build.ps1` also copies the three **drop-in files** — `2025patch.ini`,
+`RecRoomScreen.bat`, `RecRoomVR.bat` — from the repo root into the output directory, so
+`x64/Release/` is the complete set to drop into the game folder and the release zip is packed
+straight from it. Running MSBuild directly skips that copy and leaves you with the binaries only.
 
-There is no test suite, linter, or CI. Verification is empirical: run the game, read
-`2025patch.log`.
+`RecRoomScreen.bat` / `RecRoomVR.bat` are the shipped one-click launchers: `cd /d "%~dp0"`, start
+`Injector.exe`, then `Recroom_Release.exe +forcemode:screen|vr`. **Everything they reference is
+relative, so they only work from the game folder**, and they are two copies of one script differing
+in the `forcemode` argument: change one, change the other.
+
+CI (`.github/workflows/build.yml`) builds Release|x64 on every push and cuts a zip on a `v*` tag.
+There is no test suite and no linter — verification is empirical: run the game, read `2025patch.log`.
 
 **Debug|x64 does not link.** The `ml64.exe` CustomBuild step for `RetSpoof.asm` in
 `2025Patch/2025Patch.vcxproj` is conditioned on `Release|x64` only, so a Debug build has no
@@ -107,10 +117,18 @@ held the queue **24.68s**, pushing the blob to 36.6s and blowing the timeout. Bl
 retry, not the lookup. **Only an instant 2xx stops the backoff.** Stub the endpoint server-side
 first, *then* remove the host from `IsDeadHost`; removing it without a stub just restores NXDOMAIN.
 
+**This queue also takes Photon down.** The Photon symptom — joins, ~4 `SetProperties` answered, then
+~50s of silence ending in `Unable to send message!` — is a **backlog of Backtrace crash uploads**,
+not a Photon or Luxon fault (running against real Photon Cloud reproduced it identically) and not
+missing room save data (rooms with no save blob load fine). `submit.backtrace.io` is in `IsDeadHost`
+and `BlockDeadHosts` defaults to `true` for this reason, not just to keep telemetry off the wire.
+
 The `[Pump]` / `[Send]` tracers exist to make this visible. To find what starves the queue, diff
 consecutive `[Send]` timestamps and take the single largest gap — it names the blocking request
 directly. And before concluding a request "was never sent", check the log covers enough wall-clock
-after it: for a long time the blob looked undispatched when it was merely 6s late.
+after it: for a long time the blob looked undispatched when it was merely 6s late. Note the general
+trap both wrong answers above share: on a serial queue the starving request is not the one that
+visibly fails, so the loudest thing in the log is rarely the cause.
 
 ### Calling back into il2cpp
 
@@ -144,8 +162,9 @@ times. `std::cout` calls therefore go nowhere; every one of them is mirrored by 
 and new diagnostics should use `PatchLog`.
 
 `Patch()` is split accordingly: the load-bearing hooks install unconditionally — Referee x4, the TLS
-`NotifyServerCertificate` no-op, `SendRequest_H` (host rewrite), `CheatQuit_H`, `VerifyImageSig_H`,
-the two winsock DNS hooks and `ConnectUsingSettings_H` — while all 19 diagnostic hooks live in one
+`NotifyServerCertificate` no-op, `SendRequest_H` (host rewrite), `CheatQuit_H`, `VerifyImageSig_H`
+and the two winsock DNS hooks — `ConnectUsingSettings_H` installs only when `PhotonHost` *and*
+`PhotonPort` are both set, since it would otherwise be a no-op — while all 19 diagnostic hooks live in one
 `if (RR::Config::EnableTracing)` block and are not installed at all when it is off. Routine
 per-request chatter uses the `TraceLog` macro (a no-op unless tracing is on) so `SendRequest_H` stays
 quiet without losing the rewrite; genuine anomalies there still use `PatchLog` unconditionally.
@@ -172,26 +191,34 @@ Read at attach by `RR::Config::Load()` (`2025Patch/src/RR/Config.h`), called fro
 | key | default | effect |
 | --- | --- | --- |
 | `ApiHost` | `ns.recflare.net` | replaces `ns.rec.net` in BestHTTP request URIs |
-| `PhotonHost` | `photon.recflare.net` | `getaddrinfo` target for `*.photonengine` / `exitgames` / `photonindustries` |
-| `UsePhotonCloud` | `false` | `false` = self-hosted (DNS redirect on); `true` = real Photon Cloud (redirect off, `CloudAppId*` injected into `AppSettings`) |
-| `PhotonPort` | `0` | self-hosted only; overrides `AppSettings.Port` for the initial connect. `0` = leave the supplied port |
+| `PhotonHost` | `photon.recflare.net` | `getaddrinfo` target for `*.photonengine` / `exitgames` / `photonindustries`. **Empty = make no Photon changes at all** — no DNS redirect, no `AppSettings` write, `ConnectUsingSettings_H` not even hooked |
+| `PhotonPort` | `0` | requires `PhotonHost`; overrides `AppSettings.Port` for the initial connect. `0` = leave the supplied port |
 | `EnableConsole` | `false` | AllocConsole debug window. Costs load time (focus theft → Unity throttling); everything it prints is already in `2025patch.log` |
-| `BlockDeadHosts` | `true` | `getaddrinfo` returns `WSAHOST_NOT_FOUND` for `IsDeadHost` matches. **Third-party hosts only** — rudderstack, backtrace, statsig, `cloud.unity3d.com`. Most are still *live*, so this is as much about not shipping an archival session's telemetry and crash dumps to unrelated companies as it is about latency. Never list a `*.recflare.net` host: see the serial-queue warning above |
+| `BlockDeadHosts` | `true` | `getaddrinfo` returns `WSAHOST_NOT_FOUND` for `IsDeadHost` matches. **Third-party hosts only** — rudderstack, backtrace, statsig, `cloud.unity3d.com`. Most are still *live*, so this keeps an archival session's telemetry and crash dumps off unrelated companies' servers — but the backtrace entry is load-bearing: its upload backlog is what disconnects Photon. Never list a `*.recflare.net` host: see the serial-queue warning above |
 | `EnableTracing` | `false` | Installs the diagnostic hooks ([Pump]/[Send] queue probes, Photon operation/status/event tracers, HttpClient paths, BestHTTP responses) and un-quiets `SendRequest`'s per-request lines. Off = none of them are hooked at all |
-| `CloudAppIdRealtime` / `CloudAppIdVoice` / `CloudAppIdChat` | the dashboard GUIDs | Cloud only; empty keeps the server-supplied id |
-| `CloudFixedRegion` | *(empty)* | Cloud only; e.g. `us`. Empty = pick via name server |
 
 The file is created with these defaults on first run if absent, and never overwritten afterwards.
 A byte-identical copy lives at the repo root as `2025patch.ini` and is staged into `x64/Release/` by
-the CI workflow (together with the two `.bat` launchers) so it ends up in the release zip beside the
+`build.ps1` (together with the two `.bat` launchers) so it ends up in the release zip beside the
 DLL and injector — **when you change `WriteDefaultFile`, change that file too**, or the shipped example drifts from what the patch writes.
 
 Host values are sanitized to a bare host (scheme and path stripped) because `PhotonHost` is a
 `getaddrinfo` node name, not a URL. Malformed input never leaves the patch in a broken state: a
-blank host, a non-boolean flag, or an out-of-range port logs a line and keeps the default (a
-non-numeric port reads as `0`, i.e. "leave it alone"). Empty *is* honoured for the app ids and
-region, where it means "keep what the server sent". Booleans accept `true/false`, `1/0`, `yes/no`,
-`on/off`. The effective set is logged as `[Config] ...`, plus `[Patch] API host=... backend=...`.
+blank `ApiHost`, a non-boolean flag, or an out-of-range port logs a line and keeps the default (a
+non-numeric port reads as `0`, i.e. "leave it alone"). Booleans accept `true/false`, `1/0`, `yes/no`,
+`on/off`. The effective set is logged as `[Config] ...`, plus `[Patch] API host=... Photon=...`.
+
+`PhotonHost` is the exception, and `ReadPhotonHost` handles it separately: it is the master switch
+for the Photon swap, so an **explicitly blank** `PhotonHost=` clears the default instead of keeping
+it, and the patch then leaves Photon completely alone. The three cases are kept distinct on purpose —
+key absent keeps the default, present-and-blank disables, and present-but-unsanitizable (`https://`)
+is malformed input and keeps the default.
+
+There is no app-id knob and no Cloud flag: this client takes its Realtime/Voice/Chat app ids from an
+endpoint on the server, not from `AppSettings`, so swapping the Photon server is the entire job.
+`UsePhotonCloud` + `CloudAppId*` + `CloudFixedRegion` existed to A/B against real Photon Cloud and
+were removed once it was established that the `AppSettings.AppId*` writes did nothing — see the
+PHOTON BACKEND SELECTION block in Patches.h, which keeps the finding.
 
 `PhotonPort` has to go through `AppSettings` rather than the DNS hooks — a port never passes through
 `getaddrinfo` — so it is applied in `ConnectUsingSettings_H`, and the master still hands out its own

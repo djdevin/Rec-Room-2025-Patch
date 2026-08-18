@@ -22,19 +22,14 @@ jobs:
       # windows-latest ships VS 2022 with the v143 toolset and ml64.exe; build.ps1
       # locates MSBuild via vswhere exactly as it does locally, so CI and a local
       # build stay one source of truth.
+      #
+      # build.ps1 also stages 2025patch.ini and the two .bat launchers into x64\Release
+      # after a successful build, so the artifact -- and the release zip built from it --
+      # is one flat drop-in set and the release job needs no second checkout. That staging
+      # deliberately lives in the script, not here, so a local build produces the same set.
       - name: Build
         shell: pwsh
         run: .\build.ps1 -Verbosity minimal
-
-      # The example ini is the same text Config::WriteDefaultFile emits on first run, so
-      # shipping it only saves the user a first launch to discover the knobs. The two .bat
-      # launchers resolve everything relative to themselves, so they only work from the
-      # game folder. Staged into the build output so the artifact -- and the release zip
-      # built from it -- is one flat drop-in set, and the release job needs no second
-      # checkout.
-      - name: Stage example config and launchers
-        shell: pwsh
-        run: Copy-Item 2025patch.ini, RecRoomScreen.bat, RecRoomVR.bat x64\Release\
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -8,6 +8,10 @@
     the ml64.exe CustomBuild step for RetSpoof.asm is conditioned on Release|x64 only,
     so a Debug build has no _spoofer_stub to link against.
 
+    After a successful build it also stages the drop-in files -- 2025patch.ini and the two
+    .bat launchers -- next to the binaries, so the output directory is the complete set to
+    copy into the game folder.
+
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -Rebuild
@@ -108,6 +112,13 @@ if ($Clean) {
 $outDir = Join-Path $root "$Platform\$Configuration"
 $artifacts = @('2025Patch.dll', 'Injector.exe')
 
+# Files that ship beside the binaries. The ini is byte-identical to what Config::WriteDefaultFile
+# writes on first run, so it only saves the user a launch to discover the knobs; the two .bat
+# launchers resolve everything relative to themselves and therefore only work from the game folder.
+# Staged here rather than in the CI workflow so a local build and CI produce the same flat drop-in
+# set from one source of truth -- the release zip is packed straight from this directory.
+$dropIns = @('2025patch.ini', 'RecRoomScreen.bat', 'RecRoomVR.bat')
+
 Write-Host ''
 Write-Host "BUILD SUCCEEDED -> $outDir" -ForegroundColor Green
 
@@ -123,6 +134,17 @@ foreach ($name in $artifacts) {
     }
 }
 
+foreach ($name in $dropIns) {
+    $src = Join-Path $root $name
+    if (-not (Test-Path $src)) {
+        Write-Warning "$name not found at the repo root; not staged into $outDir."
+        continue
+    }
+    Copy-Item -Path $src -Destination $outDir -Force
+    $item = Get-Item (Join-Path $outDir $name)
+    Write-Host ("  {0,-16} {1,10:N0} bytes  {2}  (staged)" -f $item.Name, $item.Length, $item.LastWriteTime)
+}
+
 if ($missing.Count -gt 0) {
     Write-Host ''
     Write-Host ("Expected artifact(s) missing: {0}" -f ($missing -join ', ')) -ForegroundColor Red
@@ -130,5 +152,5 @@ if ($missing.Count -gt 0) {
 }
 
 Write-Host ''
-Write-Host 'Ship 2025Patch.dll and Injector.exe side by side; the injector defaults to 2025Patch.dll next to itself.'
-Write-Host 'RecRoomScreen.bat / RecRoomVR.bat (repo root) go in the game folder and start the injector, then the game.'
+Write-Host "Everything in $outDir is the drop-in set: copy it into the game folder."
+Write-Host 'The injector defaults to 2025Patch.dll next to itself; 2025patch.ini and the game read from the game folder.'

@@ -431,66 +431,57 @@ bool VerifyImageSig_H(void* data, void* sig, void* mi) {
 // =============================================================================================
 // PHOTON BACKEND SELECTION
 //
-// All of these live in 2025patch.ini now (RR::Config, see Config.h) -- defaults in parentheses.
+// The whole Photon story is ONE knob: RR::Config::PhotonHost (2025patch.ini, default
+// photon.recflare.net), plus PhotonPort for the initial connect port.
 //
-// UsePhotonCloud = false (default) -> self-hosted Photon server (Luxon). DNS for the Photon name
-//                           server is redirected to PhotonHost (photon.recflare.net), and
-//                           PhotonPort, if non-zero, overrides the connect port.
-// UsePhotonCloud = true  -> real Photon Cloud. The DNS redirect is skipped so ns.exitgames.com
-//                           resolves normally, and CloudAppIdRealtime/Voice/Chat + CloudFixedRegion
-//                           are injected into AppSettings just before connect (the server-supplied
-//                           ids belong to the self-hosted deployment and are not valid on Cloud).
+//   PhotonHost set   -> DNS for *.photonengine / exitgames / photonindustries is redirected to it,
+//                       and PhotonPort, if non-zero, overrides the connect port on AppSettings.
+//   PhotonHost empty -> NOTHING here runs. No DNS redirect, no AppSettings write, and the
+//                       ConnectUsingSettings hook is not installed at all. The client reaches
+//                       whatever Photon server its backend points it at.
 //
-// This exists to isolate a failure: against Luxon the client joins, gets ~4 SetProperties answered,
-// then receives NO responses for ~50s and dies with "Unable to send message!". Running the same
-// client against Photon Cloud says whether that is a Luxon bug or a client/patch bug -- worth
-// knowing before changing the server.
+// Swapping the server is genuinely all there is to do, because the app ids are NOT ours to set:
+// this client takes its Realtime/Voice/Chat ids from an endpoint on the server (Luxon hands out its
+// own "rf-..." ids), not from AppSettings. There used to be a UsePhotonCloud flag with
+// CloudAppIdRealtime/Voice/Chat and CloudFixedRegion knobs that wrote AppSettings.AppId* just before
+// connect; all of it was removed once it was established that the client never reads those fields,
+// so the writes achieved nothing. To reach a different Photon deployment, point the backend at it
+// and set PhotonHost. Do not re-add an app-id knob without first confirming the client actually
+// consumes AppSettings.AppId*.
 //
-// Set UsePhotonCloud=true ONLY to A/B against real Photon Cloud, pasting the three GUIDs from the
-// Photon dashboard (leave one empty to keep whatever the server supplied for it). That test has
-// been run: Cloud reproduced the failure identically, proving Photon/Luxon are NOT the cause -- the
-// blocker is the room's missing save data. The default stays false, i.e. the self-hosted server.
+// What that flag was for, kept because the answer still stands: against Luxon the client joins, gets
+// ~4 SetProperties answered, then receives NO responses for ~50s and dies with "Unable to send
+// message!". The same client was run against real Photon Cloud to tell a Luxon bug from a
+// client/patch bug -- Cloud reproduced the failure identically, proving Photon/Luxon are NOT the
+// cause.
+//
+// ⚠️ The cause was the BACKLOG OF BACKTRACE UPLOADS, which piles up until Photon disconnects.
+// submit.backtrace.io is in IsDeadHost below and BlockDeadHosts (default true) keeps that backlog
+// from forming.
+//
+// An earlier version of this block blamed "the room's missing save data" instead. That was WRONG,
+// and it is recorded here so it is not re-derived: rooms with no save blob load fine. The blob was
+// the loudest thing in the log, which is exactly what made it a convincing wrong answer -- the queue
+// is serial, so whatever is starving it shows up as the NEXT request failing, not as itself.
 // =============================================================================================
 
 // ---------------------------------------------------------------------------------------------
-// Inject Photon Cloud app ids into AppSettings just before the client connects.
+// Apply PhotonPort to AppSettings just before the client connects.
 //
-// The app ids normally come from the server's connection-info response and are only meaningful to
-// that deployment (Luxon logs them as "rf-..."), so they must be replaced wholesale to reach Cloud.
-// Writing the fields here -- rather than rewriting the HTTP response -- keeps it to one seam and
-// avoids touching JSON. Setting a field is a plain pointer store of a fresh il2cpp string.
+// The Photon host is redirected at the DNS layer, but a PORT never passes through getaddrinfo, so a
+// non-default one has to be written onto the settings object instead -- and this is the one seam
+// where it is fully built and not yet used. The master still hands out its own game-server ports
+// afterwards; this only moves the initial name-server/master connect.
+//
+// Only installed when PhotonHost AND PhotonPort are both set (see Patch()), so reaching this hook
+// already means the caller wants the port changed. It does not touch the app ids -- see the block
+// above; the client takes those from the server.
 // ---------------------------------------------------------------------------------------------
 bool (*ConnectUsingSettings_O)(void*, void*, void*);
 
-static void SetAppSettingsString(void* settings, int offset, const char* value, const char* label) {
-	if (!value || !*value) return;   // empty = leave the server-supplied value alone
-	using Il2cppStringNewFn = Il2cppString * (*)(const char*);
-	auto fn = reinterpret_cast<Il2cppStringNewFn>(GA + RR::Methods::Il2cpp::il2cpp_string_new);
-	Il2cppString* s = spoof_call(RetAddr, fn, value);
-	if (!s) { PatchLog("[PhotonCloud] failed to allocate string for %s", label); return; }
-	set<void*>(settings, offset, s);
-	PatchLog("[PhotonCloud] %s = %s", label, value);
-}
-
 bool ConnectUsingSettings_H(void* self, void* settings, void* mi) {
 	__try {
-		if (settings && RR::Config::UsePhotonCloud) {
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdRealtime, RR::Config::CloudAppIdRealtime, "AppIdRealtime");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdVoice,    RR::Config::CloudAppIdVoice,    "AppIdVoice");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::AppIdChat,     RR::Config::CloudAppIdChat,     "AppIdChat");
-			SetAppSettingsString(settings, RR::Offsets::AppSettings::FixedRegion,   RR::Config::CloudFixedRegion,   "FixedRegion");
-
-			// Cloud requires the name server (it is how a region is resolved), and any Server/Port
-			// override left over from the self-hosted path would send us straight back to Luxon.
-			set<bool>(settings, RR::Offsets::AppSettings::UseNameServer, true);
-			set<void*>(settings, RR::Offsets::AppSettings::Server, nullptr);
-			set<int32_t>(settings, RR::Offsets::AppSettings::Port, 0);
-			PatchLog("[PhotonCloud] UseNameServer=true, Server cleared -> connecting to Photon Cloud");
-		}
-		// Self-hosted with a non-default port: the host itself is redirected at the DNS layer, but the
-		// port never passes through getaddrinfo, so it has to be set on AppSettings here. 0 (the
-		// default) leaves whatever the client/server negotiated, which is the previous behaviour.
-		else if (settings && RR::Config::PhotonPort != 0) {
+		if (settings && *RR::Config::PhotonHost && RR::Config::PhotonPort != 0) {
 			int32_t was = read<int32_t>(settings, RR::Offsets::AppSettings::Port);
 			set<int32_t>(settings, RR::Offsets::AppSettings::Port, (int32_t)RR::Config::PhotonPort);
 			PatchLog("[Photon] Port %d -> %d (PhotonPort, host %s via DNS redirect)",
@@ -521,7 +512,9 @@ bool IsDeadHost(const std::string& node) {
 	static const char* kDeadHosts[] = {
 		"rudderstack.com",    // RecNet analytics data plane
 		"statsigapi.net",     // Statsig feature flags
-		"backtrace.io",       // Backtrace crash upload
+		"backtrace.io",       // Backtrace crash upload -- LOAD-BEARING, not just telemetry hygiene:
+		                      // its upload backlog is what starves the queue until Photon
+		                      // disconnects. See the PHOTON BACKEND SELECTION block above.
 		"cloud.unity3d.com",  // Unity analytics / perf-events / remote config (uca)
 
 		// ⚠️ THIRD-PARTY HOSTS ONLY. Never add a *.recflare.net host here.
@@ -554,7 +547,8 @@ int WSAAPI getaddrinfo_H(PCSTR pNodeName, PCSTR pServiceName, const ADDRINFOA* p
 		WSASetLastError(WSAHOST_NOT_FOUND);
 		return WSAHOST_NOT_FOUND;
 	}
-	if (!RR::Config::UsePhotonCloud && pNodeName && IsPhotonHost(pNodeName)) {
+	// No PhotonHost configured = no Photon swap; the lookup falls through to the log-and-forward path.
+	if (*RR::Config::PhotonHost && pNodeName && IsPhotonHost(pNodeName)) {
 		std::cout << "Photon: " << pNodeName << " -> " << RR::Config::PhotonHost << std::endl;
 		PatchLog("[Photon] getaddrinfo %s -> %s", pNodeName, RR::Config::PhotonHost);
 		return getaddrinfo_O(RR::Config::PhotonHost, pServiceName, pHints, ppResult);
@@ -579,7 +573,7 @@ int WSAAPI GetAddrInfoW_H(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW
 			WSASetLastError(WSAHOST_NOT_FOUND);
 			return WSAHOST_NOT_FOUND;
 		}
-		if (!RR::Config::UsePhotonCloud && IsPhotonHost(node)) {
+		if (*RR::Config::PhotonHost && IsPhotonHost(node)) {
 			std::cout << "Photon: " << node << " -> " << RR::Config::PhotonHost << std::endl;
 
 			PatchLog("[Photon] GetAddrInfoW %s -> %s", node, RR::Config::PhotonHost);
@@ -811,11 +805,14 @@ namespace RR::Patches {
 		MH_CreateHookApiEx(L"ws2_32", "GetAddrInfoW", &GetAddrInfoW_H, (LPVOID*)&GetAddrInfoW_O, &GetAddrInfoWTarget);
 		MH_EnableHook(GetAddrInfoWTarget);
 
-		// Photon backend selection: inject Cloud app ids just before connect, or apply PhotonPort on
-		// the self-hosted path (no-op with the defaults, but the hook is cheap and keeps one code
-		// path -- both are config-driven now, so it must be installed either way).
-		MH_CreateHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings), &ConnectUsingSettings_H, (LPVOID*)&ConnectUsingSettings_O);
-		MH_EnableHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings));
+		// Photon connect port. Only needed when a custom Photon server AND a non-default port are
+		// both configured -- with no PhotonHost the patch leaves Photon entirely alone, so the hook
+		// is not installed rather than installed as a no-op.
+		const bool photonConnectHook = *RR::Config::PhotonHost && RR::Config::PhotonPort != 0;
+		if (photonConnectHook) {
+			MH_CreateHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings), &ConnectUsingSettings_H, (LPVOID*)&ConnectUsingSettings_O);
+			MH_EnableHook((void*)(GA + RR::Methods::Photon::ConnectUsingSettings));
+		}
 
 		// NOT hooked: EnetPeer.IsTransportEncrypted. Measured original=0, i.e. the client was ALREADY
 		// using payload encryption, so datagram encryption was never the cause of Luxon's silence.
@@ -895,9 +892,18 @@ namespace RR::Patches {
 
 		}
 
-		PatchLog("[Patch] hooks installed: Referee x4, TLS, SendRequest, CheatMgr, ImgSig, getaddrinfo, GetAddrInfoW, PhotonConnect%s", RR::Config::EnableTracing ? " + tracing" : "");
-		PatchLog("[Patch] API host=%s  Photon=%s  backend=%s", RR::Config::ApiHost,
-			RR::Config::UsePhotonCloud ? "(cloud)" : RR::Config::PhotonHost,
-			RR::Config::UsePhotonCloud ? "Photon Cloud" : "self-hosted");
+		PatchLog("[Patch] hooks installed: Referee x4, TLS, SendRequest, CheatMgr, ImgSig, getaddrinfo, GetAddrInfoW%s%s",
+			photonConnectHook ? ", PhotonConnect" : "", RR::Config::EnableTracing ? " + tracing" : "");
+		if (!*RR::Config::PhotonHost) {
+			PatchLog("[Patch] API host=%s  Photon=(unchanged -- no PhotonHost set)", RR::Config::ApiHost);
+		}
+		else if (RR::Config::PhotonPort) {
+			PatchLog("[Patch] API host=%s  Photon=%s  port=%d",
+				RR::Config::ApiHost, RR::Config::PhotonHost, RR::Config::PhotonPort);
+		}
+		else {
+			PatchLog("[Patch] API host=%s  Photon=%s  port=(as supplied)",
+				RR::Config::ApiHost, RR::Config::PhotonHost);
+		}
 	}
 }
