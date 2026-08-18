@@ -1,0 +1,68 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Release|x64 is the only configuration that links: the ml64.exe CustomBuild
+    # step for RetSpoof.asm is conditioned on Release|x64 only.
+    name: Release|x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # windows-latest ships VS 2022 with the v143 toolset and ml64.exe; build.ps1
+      # locates MSBuild via vswhere exactly as it does locally, so CI and a local
+      # build stay one source of truth.
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1 -Verbosity minimal
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2025Patch-x64
+          if-no-files-found: error
+          path: |
+            x64/Release/2025Patch.dll
+            x64/Release/Injector.exe
+            x64/Release/2025Patch.pdb
+            x64/Release/Injector.pdb
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: 2025Patch-x64
+          path: dist
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\2025Patch.dll, dist\Injector.exe `
+            -DestinationPath "2025Patch-$env:GITHUB_REF_NAME-x64.zip"
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "2025Patch-$env:GITHUB_REF_NAME-x64.zip" `
+            --repo $env:GITHUB_REPOSITORY --generate-notes
